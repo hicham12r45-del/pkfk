@@ -1,995 +1,1073 @@
 """
-Coralo - an ORIGINAL cartoon square sea-sponge character for Blender.
+SPONGEBOB SQUAREPANTS - PROCEDURAL BLENDER MODEL
+Blender 4.2 LTS | bpy | GLB export
+Style: faithful cartoon proportions with polished 3D materials and studio lighting.
 
-Run headless:
-    blender -b -P coralo.py
+Run:
+  blender --background --factory-startup --python main.py
 
-Environment variables (all optional):
-    OUT_DIR         output folder (default: "out")
-    RENDER_PREVIEW  "1" to also render out/preview.png
-
-Outputs:
-    out/model.glb    the RIGGED character + "Idle" animation (glTF binary)
-    out/coralo.blend the full scene (rig, "Idle" and "Wave" actions)
-
-Rig: armature "CoraloRig" with 18 bones (Root, Hips, Body, Mouth, two Eyes,
-two-bone Sprout, two arms with Upper/Fore/Hand, two legs with Leg/Foot).
-Every mesh part is rigidly skinned to one bone through a vertex group.
-
-Compatible with Blender 3.x and 4.x.
+Optional environment variables:
+  OUTPUT_GLB=out/model.glb
+  RENDER_PREVIEW=1
 """
+
 import bpy
 import math
 import os
-import random
 import sys
 import traceback
+from mathutils import Vector, Euler
+from math import sin, cos, pi, radians
 
-from mathutils import Vector, Quaternion
 
-
-# =====================================================================
+# ---------------------------------------------------------------------------
 # CONFIGURATION
-# =====================================================================
-OUTPUT_DIR = os.environ.get("OUT_DIR", "out")
-GLB_NAME = "model.glb"
-BLEND_NAME = "coralo.blend"
-PREVIEW_NAME = "preview.png"
-RENDER_PNG = os.environ.get("RENDER_PREVIEW", "0") == "1"
-SEED = 7
+# ---------------------------------------------------------------------------
 
-# Body dimensions (Blender units)
-BODY_W = 2.0
-BODY_D = 0.9
-BODY_H = 2.2
-BODY_BOTTOM = 0.9
-BODY_CENTER_Z = BODY_BOTTOM + BODY_H / 2.0
-BODY_TOP = BODY_BOTTOM + BODY_H
-HALF_W = BODY_W / 2.0
-HALF_D = BODY_D / 2.0
-FRONT_Y = -HALF_D          # the face looks toward -Y
-
-# Colour palette (RGBA, linear-ish values chosen for a flat cartoon look)
-COL = {
-    "body_a": (1.00, 0.42, 0.18, 1.0),
-    "body_b": (1.00, 0.55, 0.22, 1.0),
-    "limb": (0.95, 0.36, 0.15, 1.0),
-    "pore": (0.62, 0.20, 0.08, 1.0),
-    "spot": (0.55, 0.22, 0.70, 1.0),
-    "eye_white": (0.98, 0.98, 1.00, 1.0),
-    "iris": (0.30, 0.20, 0.85, 1.0),
-    "pupil": (0.02, 0.02, 0.04, 1.0),
-    "shine": (1.00, 1.00, 1.00, 1.0),
-    "lash": (0.05, 0.03, 0.08, 1.0),
-    "cheek": (1.00, 0.45, 0.55, 1.0),
-    "freckle": (0.70, 0.25, 0.10, 1.0),
-    "mouth": (0.20, 0.03, 0.05, 1.0),
-    "teeth": (1.00, 0.98, 0.92, 1.0),
-    "nose": (0.90, 0.30, 0.12, 1.0),
-    "shorts": (0.10, 0.28, 0.45, 1.0),
-    "belt": (0.12, 0.08, 0.06, 1.0),
-    "buckle": (1.00, 0.78, 0.20, 1.0),
-    "glove": (0.98, 0.95, 0.88, 1.0),
-    "sock": (0.98, 0.96, 0.90, 1.0),
-    "sock_stripe": (0.45, 0.25, 0.80, 1.0),
-    "shoe": (0.95, 0.70, 0.12, 1.0),
-    "sole": (0.20, 0.12, 0.08, 1.0),
-    "stem": (0.20, 0.60, 0.25, 1.0),
-    "leaf": (0.35, 0.78, 0.30, 1.0),
-    "ground": (0.93, 0.85, 0.65, 1.0),
+CONFIG = {
+    "output": os.environ.get("OUTPUT_GLB", "out/model.glb"),
+    "render_preview": os.environ.get("RENDER_PREVIEW", "0") == "1",
+    "resolution_x": 1600,
+    "resolution_y": 1600,
+    "resolution_percentage": 100,
+    "samples": 64,
+    "character_height": 5.8,
+    "bevel_segments": 5,
+    "body_subdivisions": 2,
+    "detail_quality": 1.0,
 }
 
-PARTS = []      # every character object is registered here
-_MATS = {}      # material cache
-
-# Shared layout constants (used by both the meshes and the rig)
-EYE_X = 0.42
-EYE_Z = 2.45
-LEG_X = 0.45
-ARM_POSE = {
-    # left arm waves hello, right arm rests by the side
-    "L": {"side": -1.0, "shoulder": (-1.0, 0.0, 2.15),
-          "elbow": (-1.55, -0.08, 2.60), "wrist": (-1.72, -0.25, 3.15)},
-    "R": {"side": 1.0, "shoulder": (1.0, 0.0, 2.15),
-          "elbow": (1.50, -0.10, 1.72), "wrist": (1.62, -0.26, 1.28)},
-}
+COLLECTIONS = {}
+MATERIALS = {}
+ROOT = None
 
 
-# =====================================================================
-# GENERIC HELPERS
-# =====================================================================
-def log(msg):
-    print("[Coralo] " + msg)
+# ---------------------------------------------------------------------------
+# SCENE AND COLLECTION UTILITIES
+# ---------------------------------------------------------------------------
+
+def safe_set(obj, attribute, value):
+    """Set a Blender property only when that property exists."""
+    if hasattr(obj, attribute):
+        setattr(obj, attribute, value)
 
 
-def set_input(node, name, value):
-    """Safely set a shader node input (names differ between versions)."""
-    if node is not None and name in node.inputs:
-        try:
-            node.inputs[name].default_value = value
-        except Exception:
-            pass
+def get_collection(name):
+    """Return a named collection, creating it when necessary."""
+    if name in COLLECTIONS:
+        return COLLECTIONS[name]
+    collection = bpy.data.collections.new(name)
+    bpy.context.scene.collection.children.link(collection)
+    COLLECTIONS[name] = collection
+    return collection
 
 
-def make_material(name, color, roughness=0.55, metallic=0.0,
-                  subsurface=0.0, specular=0.4):
-    """Create (or fetch) a Principled BSDF material."""
-    if name in _MATS:
-        return _MATS[name]
-    mat = bpy.data.materials.new(name)
-    mat.use_nodes = True
-    mat.diffuse_color = color
-    bsdf = mat.node_tree.nodes.get("Principled BSDF")
-    set_input(bsdf, "Base Color", color)
-    set_input(bsdf, "Roughness", roughness)
-    set_input(bsdf, "Metallic", metallic)
-    set_input(bsdf, "Subsurface", subsurface)          # Blender 3.x
-    set_input(bsdf, "Subsurface Weight", subsurface)   # Blender 4.x
-    set_input(bsdf, "Specular", specular)              # Blender 3.x
-    set_input(bsdf, "Specular IOR Level", specular)    # Blender 4.x
-    _MATS[name] = mat
-    return mat
+def move_to_collection(obj, collection_name):
+    """Move an object into a clean semantic collection."""
+    target = get_collection(collection_name)
+    for old_collection in list(obj.users_collection):
+        old_collection.objects.unlink(obj)
+    target.objects.link(obj)
+    return obj
 
 
-def make_sponge_material(name):
-    """Body material: two-tone noise colour plus a fine bump for the sponge feel."""
-    mat = make_material(name, COL["body_a"], roughness=0.7, subsurface=0.15)
-    nodes = mat.node_tree.nodes
-    links = mat.node_tree.links
-    bsdf = nodes.get("Principled BSDF")
-    if bsdf is None:
-        return mat
-    try:
-        big = nodes.new("ShaderNodeTexNoise")
-        big.inputs["Scale"].default_value = 4.0
-        big.inputs["Detail"].default_value = 3.0
-        ramp = nodes.new("ShaderNodeValToRGB")
-        ramp.color_ramp.elements[0].color = COL["body_a"]
-        ramp.color_ramp.elements[1].color = COL["body_b"]
-        links.new(big.outputs["Fac"], ramp.inputs["Fac"])
-        links.new(ramp.outputs["Color"], bsdf.inputs["Base Color"])
-
-        fine = nodes.new("ShaderNodeTexNoise")
-        fine.inputs["Scale"].default_value = 70.0
-        fine.inputs["Detail"].default_value = 6.0
-        bump = nodes.new("ShaderNodeBump")
-        bump.inputs["Strength"].default_value = 0.18
-        links.new(fine.outputs["Fac"], bump.inputs["Height"])
-        links.new(bump.outputs["Normal"], bsdf.inputs["Normal"])
-    except Exception as exc:
-        log("procedural sponge nodes skipped: %s" % exc)
-    return mat
-
-
-def mat_for(key, roughness=0.55, metallic=0.0, specular=0.4):
-    return make_material("M_" + key, COL[key], roughness, metallic,
-                         0.0, specular)
-
-
-def assign(obj, mat):
-    if obj.type != 'MESH':
-        return
-    obj.data.materials.clear()
-    obj.data.materials.append(mat)
-
-
-def smooth(obj):
-    if obj.type == 'MESH':
-        for poly in obj.data.polygons:
-            poly.use_smooth = True
-
-
-def select_only(obj):
-    bpy.ops.object.select_all(action='DESELECT')
+def set_active(obj):
+    bpy.ops.object.select_all(action="DESELECT")
     obj.select_set(True)
     bpy.context.view_layer.objects.active = obj
 
 
-def apply_scale(obj):
-    select_only(obj)
-    bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+def apply_transform(obj, location=True, rotation=True, scale=True):
+    """Apply transforms to keep exported geometry predictable."""
+    set_active(obj)
+    bpy.ops.object.transform_apply(
+        location=location,
+        rotation=rotation,
+        scale=scale,
+    )
 
 
-def add_bevel(obj, width, segments=4):
-    mod = obj.modifiers.new("Bevel", 'BEVEL')
-    mod.width = width
-    mod.segments = segments
-    mod.limit_method = 'ANGLE'
-    mod.angle_limit = math.radians(30.0)
-    return mod
-
-
-def finish(obj, name, mat, do_smooth=True):
-    obj.name = name
-    if obj.data is not None:
-        obj.data.name = name + "_mesh"
-    assign(obj, mat)
-    if do_smooth:
-        smooth(obj)
-    PARTS.append(obj)
+def smooth_mesh(obj):
+    """Enable smooth shading on mesh polygons."""
+    if obj.type == "MESH":
+        for polygon in obj.data.polygons:
+            polygon.use_smooth = True
     return obj
 
 
-# =====================================================================
-# PRIMITIVE BUILDERS
-# =====================================================================
-def make_sphere(name, radius, loc, mat, scale=(1, 1, 1), rot=(0, 0, 0),
-                segments=32, rings=16):
-    bpy.ops.mesh.primitive_uv_sphere_add(radius=radius, segments=segments,
-                                         ring_count=rings, location=loc)
-    obj = bpy.context.active_object
-    obj.scale = scale
-    apply_scale(obj)
-    obj.rotation_euler = rot
-    return finish(obj, name, mat)
+def add_bevel(obj, width=0.08, segments=5, name="Soft rounded edges"):
+    """Add a weighted bevel modifier."""
+    modifier = obj.modifiers.new(name=name, type="BEVEL")
+    modifier.width = width
+    modifier.segments = segments
+    modifier.limit_method = "ANGLE"
+    modifier.angle_limit = radians(25)
+    return modifier
 
 
-def make_cylinder(name, radius, depth, loc, mat, rot=(0, 0, 0), verts=32):
-    bpy.ops.mesh.primitive_cylinder_add(radius=radius, depth=depth,
-                                        vertices=verts, location=loc,
-                                        rotation=rot)
-    obj = bpy.context.active_object
-    return finish(obj, name, mat)
+def add_weighted_normals(obj):
+    """Improve shading on hard-surface and rounded box geometry."""
+    modifier = obj.modifiers.new(name="Weighted corner normals", type="WEIGHTED_NORMAL")
+    safe_set(modifier, "keep_sharp", True)
+    safe_set(modifier, "weight", 40)
+    return modifier
 
 
-def make_box(name, size, loc, mat, rot=(0, 0, 0), bevel=0.03, segs=4):
-    bpy.ops.mesh.primitive_cube_add(size=1.0, location=loc)
-    obj = bpy.context.active_object
-    obj.scale = size
-    apply_scale(obj)
-    obj.rotation_euler = rot
-    if bevel > 0.0:
-        add_bevel(obj, bevel, segs)
-    return finish(obj, name, mat)
+def create_empty(name, location=(0, 0, 0), parent=None):
+    obj = bpy.data.objects.new(name, None)
+    get_collection("00_CHARACTER_RIG").objects.link(obj)
+    obj.location = location
+    if parent:
+        obj.parent = parent
+    return obj
 
 
-def make_torus(name, major, minor, loc, mat, rot=(0, 0, 0)):
-    bpy.ops.mesh.primitive_torus_add(major_radius=major, minor_radius=minor,
-                                     major_segments=40, minor_segments=12,
-                                     location=loc, rotation=rot)
-    obj = bpy.context.active_object
-    return finish(obj, name, mat)
+def parent_to_root(obj):
+    if ROOT is not None and obj != ROOT:
+        obj.parent = ROOT
+    return obj
 
 
-def make_segment(name, p0, p1, r0, r1, mat, verts=24):
-    """Tapered cylinder going from point p0 (radius r0) to p1 (radius r1)."""
-    a = Vector(p0)
-    b = Vector(p1)
-    direction = b - a
-    length = direction.length
-    mid = (a + b) / 2.0
-    bpy.ops.mesh.primitive_cone_add(radius1=r0, radius2=r1, depth=length,
-                                    vertices=verts, location=mid)
-    obj = bpy.context.active_object
-    obj.rotation_mode = 'QUATERNION'
-    unit = direction.normalized()
-    if abs(unit.z) > 0.9999:
-        if unit.z > 0:
-            obj.rotation_quaternion = Quaternion((1.0, 0.0, 0.0, 0.0))
-        else:
-            obj.rotation_quaternion = Quaternion((1.0, 0.0, 0.0), math.pi)
-    else:
-        obj.rotation_quaternion = unit.to_track_quat('Z', 'Y')
-    return finish(obj, name, mat)
-
-
-def make_tube(name, pts, radius, mat):
-    """Smooth bezier tube through the given points (used for the smile)."""
-    cu = bpy.data.curves.new(name + "_curve", 'CURVE')
-    cu.dimensions = '3D'
-    cu.bevel_depth = radius
-    cu.bevel_resolution = 6
-    cu.resolution_u = 24
-    cu.use_fill_caps = True
-    spline = cu.splines.new('BEZIER')
-    spline.bezier_points.add(len(pts) - 1)
-    for bp, p in zip(spline.bezier_points, pts):
-        bp.co = p
-        bp.handle_left_type = 'AUTO'
-        bp.handle_right_type = 'AUTO'
-    obj = bpy.data.objects.new(name, cu)
-    bpy.context.collection.objects.link(obj)
-    select_only(obj)
-    bpy.ops.object.convert(target='MESH')
-    obj = bpy.context.view_layer.objects.active
-    return finish(obj, name, mat)
-
-
-# =====================================================================
-# SCENE SETUP
-# =====================================================================
 def clear_scene():
-    bpy.ops.object.select_all(action='SELECT')
-    bpy.ops.object.delete()
-    for block in (bpy.data.meshes, bpy.data.materials, bpy.data.curves,
-                  bpy.data.lights, bpy.data.cameras):
-        for item in list(block):
-            if item.users == 0:
-                block.remove(item)
-    PARTS.clear()
-    _MATS.clear()
+    """Remove factory objects and stale collections."""
+    bpy.ops.object.select_all(action="SELECT")
+    bpy.ops.object.delete(use_global=False)
+    for collection in list(bpy.data.collections):
+        if collection.users == 0:
+            bpy.data.collections.remove(collection)
+    COLLECTIONS.clear()
+    MATERIALS.clear()
 
 
-def setup_world():
-    scene = bpy.context.scene
-    if scene.world is None:
-        scene.world = bpy.data.worlds.new("CoraloWorld")
-    world = scene.world
-    world.use_nodes = True
-    bg = world.node_tree.nodes.get("Background")
-    set_input(bg, "Color", (0.62, 0.80, 0.92, 1.0))
-    set_input(bg, "Strength", 0.9)
+# ---------------------------------------------------------------------------
+# MATERIAL SYSTEM
+# ---------------------------------------------------------------------------
+
+def make_material(name, color, roughness=0.55, metallic=0.0,
+                  subsurface=0.0, specular=0.35):
+    """Create a Principled BSDF material with explicit display settings."""
+    material = bpy.data.materials.new(name)
+    material.diffuse_color = (*color, 1.0)
+    material.use_nodes = True
+    nodes = material.node_tree.nodes
+    shader = nodes.get("Principled BSDF")
+    shader.inputs["Base Color"].default_value = (*color, 1.0)
+    shader.inputs["Roughness"].default_value = roughness
+    shader.inputs["Metallic"].default_value = metallic
+    if "Subsurface Weight" in shader.inputs:
+        shader.inputs["Subsurface Weight"].default_value = subsurface
+    if "Specular IOR Level" in shader.inputs:
+        shader.inputs["Specular IOR Level"].default_value = specular
+    MATERIALS[name] = material
+    return material
 
 
-def setup_render():
-    scene = bpy.context.scene
-    for engine in ('BLENDER_EEVEE_NEXT', 'BLENDER_EEVEE', 'CYCLES'):
-        try:
-            scene.render.engine = engine
-            break
-        except Exception:
-            continue
-    scene.render.resolution_x = 1280
-    scene.render.resolution_y = 1280
-    scene.render.resolution_percentage = 100
-    scene.render.image_settings.file_format = 'PNG'
-    try:
-        scene.view_settings.view_transform = 'Standard'
-    except Exception:
-        pass
+def add_noise_bump(material, scale=28.0, strength=0.18, distance=0.035):
+    """Add subtle procedural surface grain without relying on image textures."""
+    nodes = material.node_tree.nodes
+    links = material.node_tree.links
+    shader = nodes.get("Principled BSDF")
+    noise = nodes.new("ShaderNodeTexNoise")
+    noise.inputs["Scale"].default_value = scale
+    noise.inputs["Detail"].default_value = 3.0
+    noise.inputs["Roughness"].default_value = 0.72
+    bump = nodes.new("ShaderNodeBump")
+    bump.inputs["Strength"].default_value = strength
+    bump.inputs["Distance"].default_value = distance
+    links.new(noise.outputs["Fac"], bump.inputs["Height"])
+    links.new(bump.outputs["Normal"], shader.inputs["Normal"])
 
 
-# =====================================================================
-# BODY
-# =====================================================================
-def build_body():
-    log("building body")
-    body_mat = make_sponge_material("M_body")
-    bpy.ops.mesh.primitive_cube_add(size=1.0,
-                                    location=(0, 0, BODY_CENTER_Z))
-    body = bpy.context.active_object
-    body.scale = (BODY_W, BODY_D, BODY_H)
-    apply_scale(body)
-    add_bevel(body, 0.14, 8)
-    finish(body, "Body", body_mat)
+def build_materials():
+    """Build all character and studio materials."""
+    yellow = make_material("Sponge - warm golden yellow", (1.0, 0.72, 0.035), 0.72, 0.0, 0.035)
+    add_noise_bump(yellow, 34, 0.22, 0.045)
+
+    yellow_light = make_material("Sponge - pore inner gold", (0.78, 0.43, 0.012), 0.9)
+    yellow_high = make_material("Sponge - pore rim", (1.0, 0.84, 0.16), 0.75)
+
+    white = make_material("Shirt and eye whites", (0.96, 0.97, 0.93), 0.42)
+    eye_white = make_material("Eye whites - glossy", (1.0, 0.99, 0.96), 0.18)
+    blue = make_material("Iris - ocean blue", (0.025, 0.32, 0.88), 0.22, 0.05)
+    blue_light = make_material("Iris - inner azure", (0.08, 0.68, 1.0), 0.2)
+    black = make_material("Pupils and eyelashes", (0.008, 0.009, 0.014), 0.2)
+    dark_brown = make_material("Mouth interior", (0.105, 0.018, 0.012), 0.75)
+    tooth = make_material("Teeth - enamel", (1.0, 0.99, 0.9), 0.2)
+    pink = make_material("Tongue - coral pink", (0.92, 0.12, 0.29), 0.38)
+    cheek = make_material("Cheek warm blush", (1.0, 0.48, 0.25), 0.72)
+    freckle = make_material("Freckles - warm brown", (0.48, 0.16, 0.025), 0.8)
+    red = make_material("Tie - bright red", (0.82, 0.018, 0.035), 0.3)
+    brown = make_material("Shorts - cocoa brown", (0.34, 0.145, 0.055), 0.78)
+    brown_dark = make_material("Shorts - seams", (0.16, 0.065, 0.025), 0.8)
+    belt = make_material("Belt - dark umber", (0.12, 0.055, 0.025), 0.38)
+    gold = make_material("Belt buckle - warm brass", (0.95, 0.62, 0.12), 0.25, 0.72)
+    sock_white = make_material("Socks - white cotton", (0.92, 0.94, 0.92), 0.82)
+    sock_red = make_material("Sock stripe - red", (0.82, 0.02, 0.04), 0.6)
+    sock_blue = make_material("Sock stripe - blue", (0.025, 0.2, 0.72), 0.6)
+    shoe = make_material("Shoes - polished black leather", (0.012, 0.014, 0.02), 0.22)
+    sole = make_material("Shoes - rubber sole", (0.035, 0.03, 0.028), 0.82)
+    seam = make_material("Shoe stitching", (0.18, 0.17, 0.15), 0.65)
+    return {
+        "yellow": yellow, "yellow_light": yellow_light, "yellow_high": yellow_high,
+        "white": white, "eye_white": eye_white, "blue": blue,
+        "blue_light": blue_light, "black": black, "mouth": dark_brown,
+        "tooth": tooth, "pink": pink, "cheek": cheek, "freckle": freckle,
+        "red": red, "brown": brown, "brown_dark": brown_dark,
+        "belt": belt, "gold": gold, "sock_white": sock_white,
+        "sock_red": sock_red, "sock_blue": sock_blue,
+        "shoe": shoe, "sole": sole, "seam": seam,
+    }
+
+
+# ---------------------------------------------------------------------------
+# PRIMITIVE BUILDERS
+# ---------------------------------------------------------------------------
+
+def cube_part(name, location, scale, material, bevel=0.05,
+              collection="10_BODY", rotation=(0, 0, 0)):
+    bpy.ops.mesh.primitive_cube_add(size=1, location=location, rotation=rotation)
+    obj = bpy.context.object
+    obj.name = name
+    obj.dimensions = scale
+    apply_transform(obj, location=False, rotation=False, scale=True)
+    if material:
+        obj.data.materials.append(material)
+    if bevel:
+        add_bevel(obj, bevel, CONFIG["bevel_segments"])
+        add_weighted_normals(obj)
+    move_to_collection(obj, collection)
+    parent_to_root(obj)
+    return obj
+
+
+def uv_sphere(name, location, scale, material, segments=32, rings=20,
+              collection="20_FACE", rotation=(0, 0, 0)):
+    bpy.ops.mesh.primitive_uv_sphere_add(
+        segments=segments, ring_count=rings, radius=1,
+        location=location, rotation=rotation,
+    )
+    obj = bpy.context.object
+    obj.name = name
+    obj.scale = scale
+    if material:
+        obj.data.materials.append(material)
+    smooth_mesh(obj)
+    move_to_collection(obj, collection)
+    parent_to_root(obj)
+    return obj
+
+
+def cylinder_part(name, location, radius, depth, material,
+                  vertices=32, rotation=(0, 0, 0), bevel=0.025,
+                  collection="30_CLOTHING"):
+    bpy.ops.mesh.primitive_cylinder_add(
+        vertices=vertices, radius=radius, depth=depth,
+        location=location, rotation=rotation,
+    )
+    obj = bpy.context.object
+    obj.name = name
+    if material:
+        obj.data.materials.append(material)
+    smooth_mesh(obj)
+    if bevel:
+        add_bevel(obj, bevel, 3)
+    move_to_collection(obj, collection)
+    parent_to_root(obj)
+    return obj
+
+
+def curve_tube(name, points, radius, material, collection="20_FACE",
+               resolution=16, cyclic=False):
+    """Create a smooth bevelled curve through a list of 3D points."""
+    curve = bpy.data.curves.new(name, type="CURVE")
+    curve.dimensions = "3D"
+    curve.resolution_u = 24
+    curve.bevel_depth = radius
+    curve.bevel_resolution = 4
+    spline = curve.splines.new("BEZIER")
+    spline.bezier_points.add(len(points) - 1)
+    for point, coordinate in zip(spline.bezier_points, points):
+        point.co = coordinate
+        point.handle_left_type = "AUTO"
+        point.handle_right_type = "AUTO"
+    spline.use_cyclic_u = cyclic
+    obj = bpy.data.objects.new(name, curve)
+    get_collection(collection).objects.link(obj)
+    if material:
+        curve.materials.append(material)
+    parent_to_root(obj)
+    return obj
+
+
+def mesh_from_rings(name, rings, material, collection="10_BODY",
+                    segments=32, cap=True):
+    """Build a closed ring-based mesh. Each ring is (center, rx, ry, z)."""
+    vertices = []
+    faces = []
+    for center_x, center_y, z, radius_x, radius_y in rings:
+        for index in range(segments):
+            angle = 2 * pi * index / segments
+            vertices.append((
+                center_x + cos(angle) * radius_x,
+                center_y + sin(angle) * radius_y,
+                z,
+            ))
+    for ring_index in range(len(rings) - 1):
+        for index in range(segments):
+            a = ring_index * segments + index
+            b = ring_index * segments + (index + 1) % segments
+            c = (ring_index + 1) * segments + (index + 1) % segments
+            d = (ring_index + 1) * segments + index
+            faces.append((a, b, c, d))
+    if cap:
+        faces.append(tuple(range(segments - 1, -1, -1)))
+        start = (len(rings) - 1) * segments
+        faces.append(tuple(start + i for i in range(segments)))
+    mesh = bpy.data.meshes.new(name + "Mesh")
+    mesh.from_pydata(vertices, [], faces)
+    mesh.materials.append(material)
+    mesh.update()
+    obj = bpy.data.objects.new(name, mesh)
+    get_collection(collection).objects.link(obj)
+    smooth_mesh(obj)
+    parent_to_root(obj)
+    return obj
+
+
+# ---------------------------------------------------------------------------
+# BODY: SQUARE SPONGE SILHOUETTE
+# ---------------------------------------------------------------------------
+
+def create_body():
+    """Create the iconic slightly wavy rectangular sponge body."""
+    body = cube_part(
+        "SpongeBody_Main", (0, 0, 3.82), (2.42, 0.82, 2.62),
+        MATERIALS["yellow"], bevel=0.22,
+    )
+    # Add a subtle displacement modifier for a softly irregular sponge edge.
+    texture = bpy.data.textures.new("Sponge edge micro waviness", type="CLOUDS")
+    texture.noise_scale = 0.32
+    displacement = body.modifiers.new("Very subtle sponge silhouette", "DISPLACE")
+    displacement.texture = texture
+    displacement.strength = 0.035
+    displacement.mid_level = 0.5
+    safe_set(displacement, "texture_coords", "LOCAL")
+    # Smooth bevel edges while retaining a readable square silhouette.
+    add_weighted_normals(body)
+
+    # Lower body transition above the shorts.
+    cube_part(
+        "Lower sponge transition", (0, 0, 2.58), (2.28, 0.79, 0.22),
+        MATERIALS["yellow"], 0.08,
+    )
     return body
 
 
-def surface_point(face, u, v):
-    """Return (position, normal axis letter) on a body face."""
-    if face == "front":
-        return Vector((u, -HALF_D, v)), 'y'
-    if face == "back":
-        return Vector((u, HALF_D, v)), 'y'
-    if face == "left":
-        return Vector((-HALF_W, u, v)), 'x'
-    if face == "right":
-        return Vector((HALF_W, u, v)), 'x'
-    return Vector((u, v, BODY_TOP)), 'z'    # top
+def create_pore(name, x, z, radius_x, radius_z, depth=0.018):
+    """A pore is a dark inset oval plus a softly raised golden lip."""
+    uv_sphere(
+        name + "_Inset",
+        (x, -0.414, z),
+        (radius_x, depth, radius_z),
+        MATERIALS["yellow_light"],
+        24, 16, "15_SPONGE_PORES",
+    )
+    # A small highlight sits above the inset to suggest a rounded sponge rim.
+    uv_sphere(
+        name + "_RimHighlight",
+        (x - radius_x * 0.22, -0.431, z + radius_z * 0.28),
+        (radius_x * 0.48, depth * 0.34, radius_z * 0.16),
+        MATERIALS["yellow_high"],
+        16, 10, "15_SPONGE_PORES",
+    )
 
 
-def flat_scale(axis, r, thickness):
-    if axis == 'x':
-        return (thickness, r, r)
-    if axis == 'y':
-        return (r, thickness, r)
-    return (r, r, thickness)
-
-
-def inside_face_area(face, u, v):
-    """True when a front-face sample would land on the face / shorts."""
-    if face != "front":
-        return False
-    return abs(u) < 0.80 and 1.40 < v < 2.90
-
-
-def scatter_pores():
-    log("scattering sponge pores")
-    rng = random.Random(SEED)
-    pore_mat = mat_for("pore", roughness=0.9)
-    plan = [
-        ("front", 16, (-0.92, 0.92), (1.45, 3.02)),
-        ("back", 18, (-0.9, 0.9), (1.45, 3.0)),
-        ("left", 10, (-0.38, 0.38), (1.45, 3.0)),
-        ("right", 10, (-0.38, 0.38), (1.45, 3.0)),
-        ("top", 8, (-0.85, 0.85), (-0.35, 0.35)),
+def create_sponge_pores():
+    """Place asymmetrical pores around the face and visible body edges."""
+    pores = [
+        (-1.00, 4.88, .105, .075), (-.72, 5.02, .055, .045),
+        (.91, 4.98, .12, .08), (1.05, 4.62, .07, .10),
+        (-1.06, 4.18, .075, .11), (-.96, 3.78, .06, .07),
+        (.98, 3.95, .09, .065), (1.08, 3.58, .055, .09),
+        (-1.02, 3.25, .12, .07), (.91, 3.12, .07, .05),
+        (-.90, 2.98, .06, .05), (.72, 5.12, .045, .04),
+        (-1.12, 4.52, .045, .04), (1.12, 4.28, .045, .06),
+        (-.88, 5.18, .05, .035), (.98, 5.20, .05, .035),
+        (-.72, 3.42, .045, .04), (.76, 3.42, .05, .04),
     ]
-    placed = []
-    index = 0
-    for face, count, urange, vrange in plan:
-        made = 0
-        attempts = 0
-        while made < count and attempts < 400:
-            attempts += 1
-            u = rng.uniform(*urange)
-            v = rng.uniform(*vrange)
-            if inside_face_area(face, u, v):
-                continue
-            pos, axis = surface_point(face, u, v)
-            if any((pos - q).length < 0.16 for q in placed):
-                continue
-            radius = rng.uniform(0.035, 0.075)
-            normal = Vector({'x': (1, 0, 0), 'y': (0, 1, 0),
-                             'z': (0, 0, 1)}[axis])
-            sign = 1.0
-            if face in ("front", "left"):
-                sign = -1.0
-            pos = pos - normal * sign * 0.012
-            make_sphere("Pore_%02d" % index, radius, pos, pore_mat,
-                        scale=flat_scale(axis, 1.0, 0.35),
-                        segments=16, rings=8)
-            placed.append(pos)
-            made += 1
-            index += 1
-    log("pores placed: %d" % index)
+    for index, (x, z, rx, rz) in enumerate(pores):
+        create_pore("SpongePore_%02d" % index, x, z, rx, rz)
+
+    # Tiny side pores add depth when the model is viewed at an angle.
+    for side in (-1, 1):
+        for index, (y, z, size) in enumerate([
+            (-.18, 4.95, .055), (.16, 4.48, .07),
+            (-.12, 3.95, .045), (.18, 3.42, .06),
+        ]):
+            uv_sphere(
+                "Side sponge pore %s %02d" % (side, index),
+                (side * 1.216, y, z),
+                (.018, size, size * 1.25),
+                MATERIALS["yellow_light"], 18, 12, "15_SPONGE_PORES",
+            )
 
 
-def add_spots():
-    log("adding colour spots")
-    spot_mat = mat_for("spot", roughness=0.8)
-    spots = [
-        ("front", -0.78, 2.88, 0.20), ("front", 0.74, 2.80, 0.16),
-        ("front", 0.82, 1.58, 0.13), ("front", -0.80, 1.56, 0.12),
-        ("back", -0.4, 2.5, 0.28), ("back", 0.5, 1.9, 0.24),
-        ("back", 0.2, 2.9, 0.15), ("left", 0.1, 2.6, 0.22),
-        ("right", -0.1, 2.2, 0.2), ("top", 0.5, 0.1, 0.18),
-        ("top", -0.6, -0.1, 0.14),
+# ---------------------------------------------------------------------------
+# FACE: EYES, IRIS, PUPILS AND LASHES
+# ---------------------------------------------------------------------------
+
+def create_eye(side, x):
+    """Construct one large protruding eye with layered iris geometry."""
+    label = "Left" if side < 0 else "Right"
+    center_z = 4.72
+    # White eyeball.
+    uv_sphere(
+        label + "_EyeWhite",
+        (x, -0.49, center_z),
+        (0.49, 0.31, 0.61),
+        MATERIALS["eye_white"], 48, 32,
+    )
+    # Blue iris facing the front (-Y).
+    uv_sphere(
+        label + "_Iris",
+        (x + 0.025, -0.765, center_z - 0.015),
+        (0.235, 0.085, 0.30),
+        MATERIALS["blue"], 40, 28,
+    )
+    # Inner iris ring and radial flecks.
+    uv_sphere(
+        label + "_IrisInner",
+        (x + 0.025, -0.833, center_z - 0.015),
+        (0.155, 0.035, 0.215),
+        MATERIALS["blue_light"], 32, 24,
+    )
+    # Pupil.
+    uv_sphere(
+        label + "_Pupil",
+        (x + 0.035, -0.865, center_z - 0.02),
+        (0.112, 0.045, 0.17),
+        MATERIALS["black"], 32, 24,
+    )
+    # Two catchlights per eye.
+    uv_sphere(
+        label + "_EyeCatchlight_Large",
+        (x - 0.015, -0.91, center_z + 0.105),
+        (0.055, 0.022, 0.075),
+        MATERIALS["eye_white"], 20, 14,
+    )
+    uv_sphere(
+        label + "_EyeCatchlight_Small",
+        (x + 0.09, -0.91, center_z - 0.12),
+        (0.022, 0.015, 0.03),
+        MATERIALS["eye_white"], 16, 10,
+    )
+
+    # Three distinct curved eyelashes above each eye.
+    for lash_index in range(3):
+        offset = (lash_index - 1) * 0.23
+        start_x = x + offset
+        start_z = center_z + 0.49
+        end_x = start_x + (lash_index - 1) * 0.12
+        curve_tube(
+            label + "_Eyelash_%d" % lash_index,
+            [
+                (start_x, -0.48, start_z),
+                (start_x + (lash_index - 1) * 0.035, -0.49, start_z + 0.17),
+                (end_x, -0.49, start_z + 0.34),
+            ],
+            0.035, MATERIALS["black"], "20_FACE",
+        )
+
+
+def create_eyes():
+    create_eye(-1, -0.53)
+    create_eye(1, 0.53)
+
+
+# ---------------------------------------------------------------------------
+# NOSE, CHEEKS, FRECKLES AND SMILE
+# ---------------------------------------------------------------------------
+
+def create_nose():
+    """A rounded protruding yellow nose, centered between the eyes."""
+    nose = uv_sphere(
+        "SpongeBob_Nose",
+        (0.0, -0.79, 4.20),
+        (0.145, 0.30, 0.34),
+        MATERIALS["yellow"], 40, 28,
+    )
+    # Slight highlight gives the nose a soft cartoon finish.
+    uv_sphere(
+        "Nose soft highlight",
+        (-0.045, -1.035, 4.31),
+        (0.035, 0.018, 0.085),
+        MATERIALS["yellow_high"], 18, 12,
+    )
+    return nose
+
+
+def create_cheeks():
+    """Build subtle raised cheek pads and warm blush accents."""
+    for side in (-1, 1):
+        uv_sphere(
+            "CheekPad_%s" % side,
+            (side * 0.69, -0.423, 3.93),
+            (0.40, 0.075, 0.30),
+            MATERIALS["yellow"], 32, 20,
+        )
+        uv_sphere(
+            "CheekBlush_%s" % side,
+            (side * 0.79, -0.505, 3.91),
+            (0.19, 0.018, 0.105),
+            MATERIALS["cheek"], 24, 16,
+        )
+        # Three tiny freckles arranged organically.
+        freckles = [
+            (side * .66, 4.02, .028),
+            (side * .79, 4.08, .023),
+            (side * .91, 3.99, .025),
+        ]
+        for index, (x, z, size) in enumerate(freckles):
+            uv_sphere(
+                "Freckle_%s_%d" % (side, index),
+                (x, -0.535, z),
+                (size, .012, size * .82),
+                MATERIALS["freckle"], 16, 10,
+            )
+
+
+def create_mouth():
+    """Layered smile opening, lower lip, tongue, teeth and smile corners."""
+    # Mouth opening: flattened ellipsoid placed in front of the sponge.
+    uv_sphere(
+        "MouthOpening",
+        (0, -0.465, 3.58),
+        (0.64, 0.105, 0.34),
+        MATERIALS["mouth"], 40, 28,
+    )
+    # Lower inner mouth / tongue.
+    uv_sphere(
+        "Tongue",
+        (0.02, -0.579, 3.39),
+        (0.27, 0.035, 0.105),
+        MATERIALS["pink"], 32, 20,
+    )
+    # Tongue center crease.
+    curve_tube(
+        "Tongue center crease",
+        [(0.02, -0.617, 3.35), (0.02, -0.619, 3.39),
+         (0.02, -0.617, 3.43)],
+        0.008, MATERIALS["red"],
+    )
+    # Two characteristic front teeth, individually modeled.
+    cube_part(
+        "FrontTooth_Left", (-0.105, -0.584, 3.735),
+        (0.205, 0.085, 0.245), MATERIALS["tooth"], 0.035,
+        "20_FACE",
+    )
+    cube_part(
+        "FrontTooth_Right", (0.105, -0.584, 3.735),
+        (0.205, 0.085, 0.245), MATERIALS["tooth"], 0.035,
+        "20_FACE",
+    )
+    # A thin central division between the teeth.
+    curve_tube(
+        "Tooth separation line",
+        [(0, -0.632, 3.62), (0, -0.632, 3.70), (0, -0.632, 3.82)],
+        0.006, MATERIALS["brown_dark"],
+    )
+    # Smile corners and lower smile contour.
+    curve_tube(
+        "SmileLowerContour",
+        [(-0.59, -0.54, 3.64), (-0.42, -0.57, 3.35),
+         (0, -0.59, 3.29), (0.42, -0.57, 3.35),
+         (0.59, -0.54, 3.64)],
+        0.025, MATERIALS["yellow_light"],
+    )
+    uv_sphere("SmileCorner_L", (-0.59, -0.535, 3.64),
+              (0.055, 0.025, 0.06), MATERIALS["yellow"], 18, 12)
+    uv_sphere("SmileCorner_R", (0.59, -0.535, 3.64),
+              (0.055, 0.025, 0.06), MATERIALS["yellow"], 18, 12)
+
+
+# ---------------------------------------------------------------------------
+# SHIRT, COLLAR, CUFFS AND TIE
+# ---------------------------------------------------------------------------
+
+def create_shirt():
+    """White shirt band visible between sponge and brown shorts."""
+    cube_part(
+        "WhiteShirtBand", (0, 0, 2.48), (2.24, 0.80, 0.42),
+        MATERIALS["white"], 0.07, "30_CLOTHING",
+    )
+    # Collar wings: two small angled white triangular-like pieces.
+    left = cube_part(
+        "Collar_Left", (-0.20, -0.435, 2.57), (0.36, 0.10, 0.22),
+        MATERIALS["white"], 0.035, "30_CLOTHING",
+        rotation=(0, radians(-16), radians(-5)),
+    )
+    right = cube_part(
+        "Collar_Right", (0.20, -0.435, 2.57), (0.36, 0.10, 0.22),
+        MATERIALS["white"], 0.035, "30_CLOTHING",
+        rotation=(0, radians(16), radians(5)),
+    )
+    # Shirt seam line.
+    curve_tube(
+        "Shirt lower seam",
+        [(-1.02, -0.414, 2.31), (0, -0.42, 2.30),
+         (1.02, -0.414, 2.31)],
+        0.012, MATERIALS["white"], "30_CLOTHING",
+    )
+
+
+def create_tie():
+    """Red tie knot and tapered hanging blade."""
+    uv_sphere(
+        "TieKnot",
+        (0, -0.51, 2.48),
+        (0.13, 0.075, 0.13),
+        MATERIALS["red"], 24, 16, "30_CLOTHING",
+    )
+    # Tie blade built as a beveled polygon mesh.
+    verts = [
+        (-0.105, -0.50, 2.40), (0.105, -0.50, 2.40),
+        (0.145, -0.50, 1.98), (0.0, -0.50, 1.82),
+        (-0.145, -0.50, 1.98),
+        (-0.105, -0.43, 2.40), (0.105, -0.43, 2.40),
+        (0.145, -0.43, 1.98), (0.0, -0.43, 1.82),
+        (-0.145, -0.43, 1.98),
     ]
-    for i, (face, u, v, r) in enumerate(spots):
-        pos, axis = surface_point(face, u, v)
-        make_sphere("Spot_%02d" % i, r, pos, spot_mat,
-                    scale=flat_scale(axis, 1.0, 0.18),
-                    segments=24, rings=12)
+    faces = [
+        (0, 1, 2, 3, 4), (5, 9, 8, 7, 6),
+        (0, 5, 6, 1), (1, 6, 7, 2),
+        (2, 7, 8, 3), (3, 8, 9, 4), (4, 9, 5, 0),
+    ]
+    mesh = bpy.data.meshes.new("TieBladeMesh")
+    mesh.from_pydata(verts, [], faces)
+    mesh.materials.append(MATERIALS["red"])
+    mesh.update()
+    blade = bpy.data.objects.new("TieBlade", mesh)
+    get_collection("30_CLOTHING").objects.link(blade)
+    bevel = blade.modifiers.new("Tie soft edges", "BEVEL")
+    bevel.width = 0.035
+    bevel.segments = 4
+    add_weighted_normals(blade)
+    parent_to_root(blade)
 
 
-# =====================================================================
-# FACE
-# =====================================================================
-def build_eyes():
-    log("building eyes")
-    white = mat_for("eye_white", roughness=0.15, specular=0.8)
-    iris = mat_for("iris", roughness=0.2, specular=0.7)
-    pupil = mat_for("pupil", roughness=0.1, specular=0.9)
-    shine = mat_for("shine", roughness=0.0)
-    lash = mat_for("lash", roughness=0.4)
-    eye_z = EYE_Z
-    for name, sx in (("L", -1.0), ("R", 1.0)):
-        cx = sx * EYE_X
-        make_sphere("Eye_White_" + name, 0.34,
-                    (cx, FRONT_Y - 0.03, eye_z), white,
-                    scale=(1.0, 0.5, 1.12))
-        make_sphere("Eye_Iris_" + name, 0.15,
-                    (cx - sx * 0.04, FRONT_Y - 0.20, eye_z - 0.02), iris,
-                    scale=(1.0, 0.35, 1.0))
-        make_sphere("Eye_Pupil_" + name, 0.075,
-                    (cx - sx * 0.04, FRONT_Y - 0.235, eye_z - 0.02), pupil,
-                    scale=(1.0, 0.3, 1.0), segments=24, rings=12)
-        make_sphere("Eye_Shine_" + name, 0.035,
-                    (cx - sx * 0.01, FRONT_Y - 0.255, eye_z + 0.04), shine,
-                    scale=(1.0, 0.3, 1.0), segments=16, rings=8)
-        make_sphere("Eye_Shine_Small_" + name, 0.018,
-                    (cx - sx * 0.08, FRONT_Y - 0.25, eye_z - 0.07), shine,
-                    scale=(1.0, 0.3, 1.0), segments=12, rings=6)
-        # three eyelashes fanning out from the top of the eye
-        top = Vector((cx, FRONT_Y - 0.1, eye_z + 0.36))
-        for i, angle in enumerate((-28.0, 0.0, 28.0)):
-            a = math.radians(angle)
-            length = 0.30 if i == 1 else 0.24
-            direction = Vector((math.sin(a), 0.0, math.cos(a)))
-            centre = top + direction * (length / 2.0)
-            make_cylinder("Eyelash_%s_%d" % (name, i), 0.016, length,
-                          centre, lash, rot=(0, a, 0), verts=12)
+# ---------------------------------------------------------------------------
+# SHORTS, BELT AND BUCKLE
+# ---------------------------------------------------------------------------
+
+def create_shorts():
+    """Brown square shorts with soft edges and front seam details."""
+    cube_part(
+        "BrownSquareShorts", (0, 0, 1.98), (2.18, 0.84, 0.72),
+        MATERIALS["brown"], 0.095, "40_LOWER_BODY",
+    )
+    # Slightly darker lower hem.
+    cube_part(
+        "ShortsLowerHem", (0, -0.005, 1.65), (2.10, 0.82, 0.12),
+        MATERIALS["brown_dark"], 0.035, "40_LOWER_BODY",
+    )
+    # Front vertical seam.
+    curve_tube(
+        "ShortsCenterSeam",
+        [(0, -0.431, 2.24), (0, -0.431, 2.00),
+         (0, -0.431, 1.72)],
+        0.009, MATERIALS["brown_dark"], "40_LOWER_BODY",
+    )
+    # Two pocket seam hints.
+    for side in (-1, 1):
+        curve_tube(
+            "ShortsPocket_%s" % side,
+            [(side * .70, -.435, 2.15),
+             (side * .82, -.435, 2.02),
+             (side * .70, -.435, 1.91)],
+            0.012, MATERIALS["brown_dark"], "40_LOWER_BODY",
+        )
 
 
-def build_nose_and_cheeks():
-    log("building nose, cheeks and freckles")
-    nose = mat_for("nose", roughness=0.5)
-    cheek = mat_for("cheek", roughness=0.8)
-    freckle = mat_for("freckle", roughness=0.9)
-    make_sphere("Nose", 0.14, (0.0, FRONT_Y - 0.12, 2.08), nose,
-                scale=(0.8, 1.0, 1.35))
-    make_sphere("Nose_Tip", 0.07, (0.0, FRONT_Y - 0.24, 2.0), nose,
-                scale=(1.0, 0.8, 0.9), segments=20, rings=10)
-    for name, sx in (("L", -1.0), ("R", 1.0)):
-        make_sphere("Cheek_" + name, 0.2, (sx * 0.66, FRONT_Y - 0.01, 1.86),
-                    cheek, scale=(1.0, 0.18, 0.75))
-        for i, (dx, dz) in enumerate(((-0.07, 0.07), (0.07, 0.09),
-                                      (0.0, -0.05))):
-            make_sphere("Freckle_%s_%d" % (name, i), 0.028,
-                        (sx * 0.66 + dx, FRONT_Y - 0.035, 1.86 + dz),
-                        freckle, scale=(1.0, 0.3, 1.0), segments=12, rings=6)
+def create_belt():
+    """Dark belt and a centered brass rectangular buckle."""
+    cube_part(
+        "BeltBand", (0, -0.438, 2.30), (2.16, 0.075, 0.13),
+        MATERIALS["belt"], 0.025, "40_LOWER_BODY",
+    )
+    # Buckle frame.
+    cube_part(
+        "BuckleOuter", (0, -0.493, 2.30), (0.34, 0.055, 0.20),
+        MATERIALS["gold"], 0.025, "40_LOWER_BODY",
+    )
+    cube_part(
+        "BuckleInset", (0, -0.528, 2.30), (0.235, 0.025, 0.105),
+        MATERIALS["belt"], 0.012, "40_LOWER_BODY",
+    )
+    # Small brass pin.
+    cylinder_part(
+        "BucklePin", (0, -0.55, 2.30), 0.018, 0.06,
+        MATERIALS["gold"], 16, (radians(90), 0, 0), 0.004,
+        "40_LOWER_BODY",
+    )
 
 
-def build_mouth():
-    log("building mouth")
-    mouth = mat_for("mouth", roughness=0.4)
-    teeth = mat_for("teeth", roughness=0.25, specular=0.6)
-    y = FRONT_Y - 0.035
-    make_tube("Smile", [(-0.62, y, 1.82), (0.0, y - 0.01, 1.52),
-                        (0.62, y, 1.82)], 0.032, mouth)
-    for name, sx in (("L", -1.0), ("R", 1.0)):
-        make_tube("Dimple_" + name,
-                  [(sx * 0.68, y, 1.90), (sx * 0.72, y, 1.82),
-                   (sx * 0.66, y, 1.74)], 0.02, mouth)
-    for name, sx in (("L", -1.0), ("R", 1.0)):
-        make_box("Tooth_" + name, (0.17, 0.05, 0.24),
-                 (sx * 0.095, y - 0.015, 1.40), teeth, bevel=0.025, segs=4)
+# ---------------------------------------------------------------------------
+# ARMS, SLEEVES, HANDS AND FINGERS
+# ---------------------------------------------------------------------------
+
+def create_arm(side):
+    """Create one short yellow arm emerging from the shirt sleeve."""
+    label = "Left" if side < 0 else "Right"
+    shoulder_x = side * 1.22
+    # White sleeve puff.
+    uv_sphere(
+        label + "_Sleeve",
+        (shoulder_x, 0, 2.55),
+        (0.27, 0.32, 0.25),
+        MATERIALS["white"], 28, 18, "50_ARMS",
+    )
+    # Upper arm and forearm.
+    curve_tube(
+        label + "_Arm",
+        [(side * 1.30, -0.02, 2.43),
+         (side * 1.42, -0.04, 2.16),
+         (side * 1.48, -0.08, 1.91)],
+        0.105, MATERIALS["yellow"], "50_ARMS",
+    )
+    # Wrist.
+    uv_sphere(
+        label + "_Wrist",
+        (side * 1.48, -0.08, 1.88),
+        (0.12, 0.12, 0.13),
+        MATERIALS["yellow"], 24, 16, "50_ARMS",
+    )
+    create_hand(side, (side * 1.50, -0.10, 1.72), label)
 
 
-# =====================================================================
-# CLOTHES
-# =====================================================================
-def build_shorts():
-    log("building shorts")
-    shorts = mat_for("shorts", roughness=0.85)
-    belt = mat_for("belt", roughness=0.5)
-    buckle = mat_for("buckle", roughness=0.25, metallic=0.9, specular=0.8)
-    glove = mat_for("glove", roughness=0.7)
-    make_box("Shorts", (BODY_W + 0.1, BODY_D + 0.1, 0.46),
-             (0, 0, BODY_BOTTOM + 0.23), shorts, bevel=0.07, segs=5)
-    make_box("Belt", (BODY_W + 0.14, BODY_D + 0.14, 0.1),
-             (0, 0, BODY_BOTTOM + 0.5), belt, bevel=0.03)
-    make_box("Buckle", (0.26, 0.05, 0.14),
-             (0, FRONT_Y - 0.1, BODY_BOTTOM + 0.5), buckle, bevel=0.015)
-    make_box("Buckle_Inner", (0.14, 0.06, 0.07),
-             (0, FRONT_Y - 0.105, BODY_BOTTOM + 0.5), belt, bevel=0.01)
-    for name, sx in (("L", -1.0), ("R", 1.0)):
-        make_cylinder("Button_" + name, 0.07, 0.04,
-                      (sx * 0.55, FRONT_Y - 0.075, BODY_BOTTOM + 0.22),
-                      glove, rot=(math.pi / 2.0, 0, 0), verts=24)
-        make_torus("Button_Rim_" + name, 0.07, 0.012,
-                   (sx * 0.55, FRONT_Y - 0.095, BODY_BOTTOM + 0.22), belt,
-                   rot=(math.pi / 2.0, 0, 0))
-        make_box("Pocket_" + name, (0.5, 0.03, 0.24),
-                 (sx * 0.5, FRONT_Y - 0.065, BODY_BOTTOM + 0.2), shorts,
-                 bevel=0.012, segs=2)
+def create_hand(side, center, label):
+    """Palm and four fingers plus thumb; all fingers are individually modeled."""
+    x, y, z = center
+    uv_sphere(
+        label + "_Palm",
+        (x, y, z),
+        (0.19, 0.13, 0.20),
+        MATERIALS["yellow"], 28, 18, "50_ARMS",
+    )
+    # Four fingers fan gently outward and downward.
+    finger_offsets = [
+        (-0.14, -0.12, 0.10),
+        (-0.045, -0.16, 0.18),
+        (0.055, -0.16, 0.17),
+        (0.15, -0.11, 0.11),
+    ]
+    for index, (dx, dz, length) in enumerate(finger_offsets):
+        start = (x + side * dx * 0.55, y - 0.015, z - 0.04)
+        middle = (x + side * dx, y - 0.025, z - length * 0.55)
+        end = (x + side * dx * 1.12, y - 0.015, z - length)
+        curve_tube(
+            label + "_Finger_%d" % index,
+            [start, middle, end],
+            0.047, MATERIALS["yellow"], "50_ARMS",
+        )
+        uv_sphere(
+            label + "_FingerTip_%d" % index,
+            end, (0.047, 0.047, 0.05),
+            MATERIALS["yellow"], 16, 12, "50_ARMS",
+        )
+    # Thumb points inward.
+    thumb_end = (x - side * 0.22, y - 0.02, z + 0.01)
+    curve_tube(
+        label + "_Thumb",
+        [(x - side * 0.12, y, z + 0.03),
+         (x - side * 0.20, y - 0.02, z + 0.04),
+         thumb_end],
+        0.055, MATERIALS["yellow"], "50_ARMS",
+    )
 
 
-# =====================================================================
-# LIMBS
-# =====================================================================
-def build_hand(prefix, wrist, direction, side):
-    glove = mat_for("glove", roughness=0.6)
-    d = Vector(direction).normalized()
-    lateral = d.cross(Vector((0, 1, 0)))
-    if lateral.length < 0.05:
-        lateral = Vector((1, 0, 0))
-    lateral.normalize()
-    palm_c = Vector(wrist) + d * 0.12
-    make_sphere(prefix + "_Palm", 0.15, palm_c, glove, scale=(1, 0.85, 1))
-    for i, k in enumerate((-1.0, 0.0, 1.0)):
-        base = palm_c + lateral * (k * 0.07) + d * 0.07
-        tip = palm_c + lateral * (k * 0.085) + d * 0.34
-        make_segment("%s_Finger_%d" % (prefix, i), base, tip,
-                     0.04, 0.034, glove, verts=14)
-        make_sphere("%s_Fingertip_%d" % (prefix, i), 0.036, tip, glove,
-                    segments=14, rings=8)
-    t_base = palm_c + lateral * (side * 0.1)
-    t_tip = palm_c + lateral * (side * 0.22) + d * 0.14
-    make_segment(prefix + "_Thumb", t_base, t_tip, 0.04, 0.034, glove,
-                 verts=14)
-    make_sphere(prefix + "_Thumb_Tip", 0.036, t_tip, glove,
-                segments=14, rings=8)
+def create_arms():
+    create_arm(-1)
+    create_arm(1)
 
 
-def build_arm(prefix, side, shoulder, elbow, wrist):
-    limb = mat_for("limb", roughness=0.7)
-    make_sphere(prefix + "_Shoulder", 0.1, shoulder, limb)
-    make_segment(prefix + "_Upper", shoulder, elbow, 0.085, 0.07, limb)
-    make_sphere(prefix + "_Elbow", 0.075, elbow, limb)
-    make_segment(prefix + "_Fore", elbow, wrist, 0.07, 0.06, limb)
-    build_hand(prefix + "_Hand", wrist, Vector(wrist) - Vector(elbow), side)
+# ---------------------------------------------------------------------------
+# LEGS, SOCKS AND SHOES
+# ---------------------------------------------------------------------------
+
+def create_leg(side):
+    """Thin yellow leg, white sock with stripes, and black shoe."""
+    label = "Left" if side < 0 else "Right"
+    x = side * 0.62
+    # Exposed yellow leg.
+    cylinder_part(
+        label + "_YellowLeg", (x, 0, 1.34), 0.105, 0.55,
+        MATERIALS["yellow"], 24, (0, 0, 0), 0.035, "60_LEGS",
+    )
+    # Sock body.
+    cylinder_part(
+        label + "_Sock", (x, -0.005, 0.91), 0.145, 0.42,
+        MATERIALS["sock_white"], 32, (0, 0, 0), 0.045, "60_LEGS",
+    )
+    # Red and blue horizontal stripes around the sock.
+    for stripe_index, (z, material) in enumerate([
+        (1.045, MATERIALS["sock_red"]),
+        (0.995, MATERIALS["sock_blue"]),
+    ]):
+        bpy.ops.mesh.primitive_torus_add(
+            major_radius=0.137, minor_radius=0.018,
+            major_segments=32, minor_segments=10,
+            location=(x, -0.005, z),
+        )
+        stripe = bpy.context.object
+        stripe.name = label + "_SockStripe_%d" % stripe_index
+        stripe.data.materials.append(material)
+        smooth_mesh(stripe)
+        move_to_collection(stripe, "60_LEGS")
+        parent_to_root(stripe)
+
+    # Shoe sole.
+    uv_sphere(
+        label + "_ShoeSole",
+        (x, -0.17, 0.37),
+        (0.43, 0.48, 0.105),
+        MATERIALS["sole"], 36, 24, "60_LEGS",
+    )
+    # Shoe upper: broad rounded black toe pointing forward.
+    uv_sphere(
+        label + "_ShoeUpper",
+        (x + side * 0.10, -0.20, 0.53),
+        (0.40, 0.48, 0.22),
+        MATERIALS["shoe"], 40, 28, "60_LEGS",
+    )
+    # Heel volume.
+    uv_sphere(
+        label + "_ShoeHeel",
+        (x - side * 0.19, 0.035, 0.54),
+        (0.20, 0.27, 0.22),
+        MATERIALS["shoe"], 28, 18, "60_LEGS",
+    )
+    # Subtle top shoe seam.
+    curve_tube(
+        label + "_ShoeSeam",
+        [(x - .18, -.48, .63), (x, -.54, .66),
+         (x + .18, -.48, .63)],
+        0.009, MATERIALS["seam"], "60_LEGS",
+    )
 
 
-def build_arms():
-    log("building arms")
-    for key in ("L", "R"):
-        pose = ARM_POSE[key]
-        build_arm("Arm_" + key, pose["side"], pose["shoulder"],
-                  pose["elbow"], pose["wrist"])
+def create_legs():
+    create_leg(-1)
+    create_leg(1)
 
 
-def build_legs():
-    log("building legs, socks and shoes")
-    limb = mat_for("limb", roughness=0.7)
-    sock = mat_for("sock", roughness=0.8)
-    stripe = mat_for("sock_stripe", roughness=0.8)
-    shoe = mat_for("shoe", roughness=0.45, specular=0.5)
-    sole = mat_for("sole", roughness=0.9)
-    for name, sx in (("L", -1.0), ("R", 1.0)):
-        x = sx * 0.45
-        make_segment("Leg_" + name, (x, 0, BODY_BOTTOM + 0.05),
-                     (x, 0, 0.62), 0.075, 0.07, limb)
-        make_segment("Sock_" + name, (x, 0, 0.64), (x, 0, 0.2),
-                     0.105, 0.115, sock)
-        for i, z in enumerate((0.55, 0.46)):
-            make_torus("Sock_Stripe_%s_%d" % (name, i), 0.108, 0.022,
-                       (x, 0, z), stripe)
-        make_sphere("Shoe_" + name, 0.26, (x, -0.12, 0.145), shoe,
-                    scale=(0.92, 1.45, 0.56))
-        make_sphere("Sole_" + name, 0.27, (x, -0.12, 0.058), sole,
-                    scale=(0.95, 1.5, 0.2))
-        make_sphere("Shoe_Toe_" + name, 0.1, (x, -0.38, 0.16), shoe,
-                    scale=(1.1, 0.8, 0.8), segments=20, rings=10)
+# ---------------------------------------------------------------------------
+# BACK AND SIDE DETAILS
+# ---------------------------------------------------------------------------
+
+def create_back_details():
+    """Add restrained back-side pores so the model reads from multiple angles."""
+    for index, (x, z, radius) in enumerate([
+        (-.82, 4.72, .07), (.75, 4.92, .09),
+        (-.98, 4.05, .055), (.96, 3.55, .065),
+        (-.72, 3.02, .05), (.72, 3.15, .055),
+    ]):
+        uv_sphere(
+            "BackPore_%02d" % index,
+            (x, 0.414, z),
+            (radius, .014, radius * .8),
+            MATERIALS["yellow_light"], 18, 12, "15_SPONGE_PORES",
+        )
 
 
-def build_sprout():
-    log("building sprout")
-    stem = mat_for("stem", roughness=0.6)
-    leaf = mat_for("leaf", roughness=0.5)
-    base = Vector((0.0, 0.0, BODY_TOP - 0.02))
-    tip = base + Vector((0.03, 0.0, 0.42))
-    make_segment("Sprout_Stem", base, tip, 0.05, 0.035, stem)
-    for name, sx in (("L", -1.0), ("R", 1.0)):
-        make_sphere("Sprout_Leaf_" + name, 0.18,
-                    tip + Vector((sx * 0.17, 0, 0.07)), leaf,
-                    scale=(1.0, 0.22, 0.45),
-                    rot=(0, sx * math.radians(-28.0), 0),
-                    segments=24, rings=12)
-    make_sphere("Sprout_Bud", 0.055, tip + Vector((0, 0, 0.06)), leaf,
-                segments=16, rings=8)
+# ---------------------------------------------------------------------------
+# CHARACTER ORGANIZATION AND STUDIO
+# ---------------------------------------------------------------------------
+
+def create_character_root():
+    global ROOT
+    ROOT = create_empty("SPONGEBOB_CHARACTER_ROOT", (0, 0, 0))
+    return ROOT
 
 
-# =====================================================================
-# RIG: ARMATURE, SKINNING, TESTS, ANIMATION
-# =====================================================================
-EXPECTED_BONES = [
-    "Root", "Hips", "Body", "Mouth", "Eye_L", "Eye_R",
-    "Sprout_1", "Sprout_2",
-    "Arm_L_Upper", "Arm_L_Fore", "Hand_L",
-    "Arm_R_Upper", "Arm_R_Fore", "Hand_R",
-    "Leg_L", "Foot_L", "Leg_R", "Foot_R",
-]
+def create_floor():
+    floor_mat = make_material("Studio floor - deep blue gray", (0.055, 0.075, 0.11), 0.82)
+    bpy.ops.mesh.primitive_plane_add(size=200, location=(0, 0, 0.12))
+    floor = bpy.context.object
+    floor.name = "StudioGround"
+    floor.data.materials.append(floor_mat)
+    move_to_collection(floor, "90_STUDIO")
+    return floor
 
 
-def bone_side(name):
-    if name.endswith("_L") or "_L_" in name:
-        return "L"
-    if name.endswith("_R") or "_R_" in name:
-        return "R"
-    return ""
+def aim_at(obj, target):
+    direction = Vector(target) - obj.location
+    obj.rotation_euler = direction.to_track_quat("-Z", "Y").to_euler()
 
 
-def bone_for_part(name):
-    """Decide which bone drives a mesh part, based on the part's name."""
-    side = bone_side(name)
-    if name.startswith("Arm_"):
-        if "_Hand" in name:
-            return "Hand_" + side
-        if name.endswith("_Elbow") or name.endswith("_Fore"):
-            return "Arm_%s_Fore" % side
-        return "Arm_%s_Upper" % side
-    if name.startswith(("Leg_", "Sock_")):
-        return "Leg_" + side
-    if name.startswith(("Shoe_", "Sole_")):
-        return "Foot_" + side
-    if name.startswith(("Eye_Iris", "Eye_Pupil", "Eye_Shine")):
-        return "Eye_" + side
-    if name.startswith(("Smile", "Dimple_", "Tooth_")):
-        return "Mouth"
-    if name.startswith("Sprout_Stem"):
-        return "Sprout_1"
-    if name.startswith("Sprout_"):
-        return "Sprout_2"
-    if name.startswith(("Shorts", "Belt", "Buckle", "Button", "Pocket")):
-        return "Hips"
-    return "Body"
-
-
-def build_rig():
-    log("building armature")
-    arm_data = bpy.data.armatures.new("CoraloArmature")
-    rig = bpy.data.objects.new("CoraloRig", arm_data)
-    bpy.context.collection.objects.link(rig)
-    select_only(rig)
-    bpy.ops.object.mode_set(mode='EDIT')
-    edit = arm_data.edit_bones
-
-    def add(name, head, tail, parent=None, connect=False, inherit='FULL'):
-        bone = edit.new(name)
-        bone.head = Vector(head)
-        bone.tail = Vector(tail)
-        if parent is not None:
-            bone.parent = edit[parent]
-            bone.use_connect = connect
-        bone.inherit_scale = inherit
-        return bone
-
-    add("Root", (0, 0, 0), (0, 0, 0.4))
-    add("Hips", (0, 0, BODY_BOTTOM), (0, 0, BODY_BOTTOM + 0.4), "Root")
-    add("Body", (0, 0, BODY_BOTTOM), (0, 0, BODY_TOP), "Hips")
-    add("Mouth", (0, FRONT_Y, 1.65), (0, FRONT_Y - 0.2, 1.65), "Body")
-
-    for key, sx in (("L", -1.0), ("R", 1.0)):
-        cx = sx * EYE_X
-        add("Eye_" + key, (cx, FRONT_Y - 0.03, EYE_Z),
-            (cx, FRONT_Y - 0.33, EYE_Z), "Body")
-
-    stem_tip = (0.03, 0.0, BODY_TOP + 0.40)
-    add("Sprout_1", (0, 0, BODY_TOP - 0.02), stem_tip, "Body")
-    add("Sprout_2", stem_tip, (0.03, 0.0, BODY_TOP + 0.52), "Sprout_1", True)
-
-    for key in ("L", "R"):
-        pose = ARM_POSE[key]
-        shoulder = Vector(pose["shoulder"])
-        elbow = Vector(pose["elbow"])
-        wrist = Vector(pose["wrist"])
-        hand_dir = (wrist - elbow).normalized()
-        add("Arm_%s_Upper" % key, shoulder, elbow, "Body", inherit='NONE')
-        add("Arm_%s_Fore" % key, elbow, wrist, "Arm_%s_Upper" % key, True)
-        add("Hand_" + key, wrist, wrist + hand_dir * 0.45,
-            "Arm_%s_Fore" % key, True)
-
-    for key, sx in (("L", -1.0), ("R", 1.0)):
-        x = sx * LEG_X
-        add("Leg_" + key, (x, 0, BODY_BOTTOM + 0.05), (x, 0, 0.22), "Hips")
-        add("Foot_" + key, (x, 0, 0.22), (x, -0.45, 0.12), "Leg_" + key,
-            True)
-
-    bpy.ops.object.mode_set(mode='OBJECT')
-    arm_data.display_type = 'OCTAHEDRAL'
-    rig.show_in_front = True
-    for pbone in rig.pose.bones:
-        pbone.rotation_mode = 'XYZ'
-
-    counts = skin_parts(rig)
-    verify_rig(rig, counts)
-    return rig
-
-
-def skin_parts(rig):
-    """Rigid skinning: each part gets one vertex group (weight 1.0)."""
-    bones = set(b.name for b in rig.data.bones)
-    counts = {}
-    for obj in PARTS:
-        if obj.type != 'MESH':
-            continue
-        bone_name = bone_for_part(obj.name)
-        if bone_name not in bones:
-            raise RuntimeError("no bone '%s' for part %s" %
-                               (bone_name, obj.name))
-        group = obj.vertex_groups.new(name=bone_name)
-        group.add(list(range(len(obj.data.vertices))), 1.0, 'REPLACE')
-        mod = obj.modifiers.new("Armature", 'ARMATURE')
-        mod.object = rig
-        counts[bone_name] = counts.get(bone_name, 0) + 1
-    return counts
-
-
-def verify_rig(rig, counts):
-    names = [b.name for b in rig.data.bones]
-    missing = [n for n in EXPECTED_BONES if n not in names]
-    if missing:
-        raise RuntimeError("missing bones: " + ", ".join(missing))
-    for bone in rig.data.bones:
-        if bone.length < 0.01:
-            raise RuntimeError("bone %s is too short" % bone.name)
-    unused = [n for n in EXPECTED_BONES
-              if n not in counts and n not in ("Root",)]
-    if unused:
-        log("bones without geometry (control only): " + ", ".join(unused))
-    for obj in PARTS:
-        if obj.type == 'MESH' and len(obj.vertex_groups) != 1:
-            raise RuntimeError("%s is not skinned correctly" % obj.name)
-    log("rig ok: %d bones, %d skinned parts" %
-        (len(names), sum(counts.values())))
-
-
-def evaluated_vertex(obj, index=0):
-    depsgraph = bpy.context.evaluated_depsgraph_get()
-    evaluated = obj.evaluated_get(depsgraph)
-    mesh = evaluated.to_mesh()
-    co = mesh.vertices[index].co.copy()
-    evaluated.to_mesh_clear()
-    return co
-
-
-def test_deformation(rig):
-    """Pose the left arm and make sure the palm really follows the bone."""
-    probe = bpy.data.objects.get("Arm_L_Hand_Palm")
-    if probe is None:
-        raise RuntimeError("probe part Arm_L_Hand_Palm not found")
-    bpy.context.view_layer.update()
-    before = evaluated_vertex(probe)
-    pbone = rig.pose.bones["Arm_L_Upper"]
-    pbone.rotation_euler = (0.7, 0.0, 0.0)
-    bpy.context.view_layer.update()
-    after = evaluated_vertex(probe)
-    pbone.rotation_euler = (0.0, 0.0, 0.0)
-    bpy.context.view_layer.update()
-    moved = (after - before).length
-    log("deformation test: palm moved %.3f units" % moved)
-    if moved < 0.05:
-        raise RuntimeError("skinning failed: palm did not follow the arm")
-
-
-def key_pose(rig, bone, prop, frame, value):
-    pbone = rig.pose.bones[bone]
-    setattr(pbone, prop, value)
-    pbone.keyframe_insert(data_path=prop, frame=frame)
-
-
-def reset_pose(rig):
-    for pbone in rig.pose.bones:
-        pbone.rotation_euler = (0.0, 0.0, 0.0)
-        pbone.scale = (1.0, 1.0, 1.0)
-        pbone.location = (0.0, 0.0, 0.0)
-
-
-def build_actions(rig):
-    """Two demo actions: 'Wave' (stored) and 'Idle' (active, exported)."""
-    try:
-        scene = bpy.context.scene
-        scene.frame_start = 1
-        scene.frame_end = 49
-        anim = rig.animation_data_create()
-
-        wave = bpy.data.actions.new("Wave")
-        wave.use_fake_user = True
-        anim.action = wave
-        for frame, angle in ((1, 0.0), (7, 0.5), (13, -0.5), (19, 0.5),
-                             (25, -0.5), (31, 0.0)):
-            key_pose(rig, "Hand_L", "rotation_euler", frame,
-                     (angle, 0.0, 0.0))
-        reset_pose(rig)
-
-        idle = bpy.data.actions.new("Idle")
-        idle.use_fake_user = True
-        anim.action = idle
-        for frame, squash in ((1, 1.0), (25, 0.965), (49, 1.0)):
-            widen = 1.0 + (1.0 - squash)
-            key_pose(rig, "Body", "scale", frame, (widen, widen, squash))
-        for frame, tilt in ((1, 0.0), (25, 0.1), (49, 0.0)):
-            key_pose(rig, "Sprout_1", "rotation_euler", frame,
-                     (tilt, 0.0, tilt * 0.5))
-        reset_pose(rig)
-        log("actions created: Wave, Idle (Idle is active)")
-    except Exception as exc:
-        log("animation actions skipped: %s" % exc)
-
-
-# =====================================================================
-# STAGE: GROUND, LIGHTS, CAMERA
-# =====================================================================
-def build_ground():
-    sand = mat_for("ground", roughness=0.95)
-    bpy.ops.mesh.primitive_cylinder_add(radius=4.5, depth=0.1, vertices=96,
-                                        location=(0, 0, -0.05))
-    ground = bpy.context.active_object
-    ground.name = "Ground"
-    assign(ground, sand)
-    return ground
-
-
-def add_area_light(name, loc, energy, size, target, color=(1, 1, 1)):
-    bpy.ops.object.light_add(type='AREA', location=loc)
-    light = bpy.context.active_object
+def create_area_light(name, location, energy, color, size, target):
+    bpy.ops.object.light_add(type="AREA", location=location)
+    light = bpy.context.object
     light.name = name
     light.data.energy = energy
-    light.data.size = size
     light.data.color = color
-    con = light.constraints.new('TRACK_TO')
-    con.target = target
-    con.track_axis = 'TRACK_NEGATIVE_Z'
-    con.up_axis = 'UP_Y'
+    light.data.shape = "DISK"
+    light.data.size = size
+    aim_at(light, target)
+    move_to_collection(light, "90_STUDIO")
     return light
 
 
-def build_stage():
-    log("building stage")
-    build_ground()
-    bpy.ops.object.empty_add(type='PLAIN_AXES', location=(0, 0, 1.7))
-    target = bpy.context.active_object
-    target.name = "FocusTarget"
-    add_area_light("KeyLight", (4.0, -5.0, 6.0), 900, 4.0, target,
-                   (1.0, 0.96, 0.9))
-    add_area_light("FillLight", (-5.0, -4.0, 3.0), 350, 5.0, target,
-                   (0.85, 0.92, 1.0))
-    add_area_light("RimLight", (0.0, 6.0, 5.0), 500, 3.0, target)
-    bpy.ops.object.camera_add(location=(5.2, -8.2, 3.7))
-    cam = bpy.context.active_object
-    cam.name = "Camera"
-    cam.data.lens = 55
-    con = cam.constraints.new('TRACK_TO')
-    con.target = target
-    con.track_axis = 'TRACK_NEGATIVE_Z'
-    con.up_axis = 'UP_Y'
-    bpy.context.scene.camera = cam
-    return cam
+def create_camera(name, location, target, lens=55):
+    bpy.ops.object.camera_add(location=location)
+    camera = bpy.context.object
+    camera.name = name
+    camera.data.lens = lens
+    aim_at(camera, target)
+    move_to_collection(camera, "90_STUDIO")
+    return camera
 
 
-# =====================================================================
-# ASSEMBLY, VERIFICATION, EXPORT
-# =====================================================================
-def parent_all(rig):
-    root = bpy.data.objects.new("Coralo", None)
-    root.empty_display_type = 'PLAIN_AXES'
-    bpy.context.collection.objects.link(root)
-    rig.parent = root
-    for obj in PARTS:
-        obj.parent = rig
-    log("parented %d parts under 'CoraloRig'" % len(PARTS))
-    return root
+def setup_studio():
+    """Set a three-point studio lighting rig and a hero camera."""
+    scene = bpy.context.scene
+    scene.render.engine = "CYCLES"
+    scene.cycles.samples = CONFIG["samples"]
+    safe_set(scene.cycles, "use_denoising", True)
+    scene.render.resolution_x = CONFIG["resolution_x"]
+    scene.render.resolution_y = CONFIG["resolution_y"]
+    scene.render.resolution_percentage = CONFIG["resolution_percentage"]
+    scene.render.image_settings.file_format = "PNG"
+    scene.render.film_transparent = False
+
+    world = bpy.data.worlds.new("SpongeBob Studio World") if not bpy.data.worlds else bpy.data.worlds[0]
+    scene.world = world
+    world.use_nodes = True
+    world.node_tree.nodes["Background"].inputs["Color"].default_value = (0.12, 0.16, 0.22, 1)
+    world.node_tree.nodes["Background"].inputs["Strength"].default_value = 0.35
+
+    target = (0, 0, 3.0)
+    create_area_light("Key - large softbox", (4.5, -6.0, 8.5), 950, (1.0, .83, .65), 5.0, target)
+    create_area_light("Fill - cool softbox", (-5.0, -4.0, 5.0), 650, (.58, .75, 1.0), 4.0, target)
+    create_area_light("Rim - warm backlight", (1.5, 4.0, 7.0), 1100, (1.0, .72, .38), 3.0, target)
+
+    camera = create_camera("HeroCamera_ThreeQuarter", (5.7, -10.5, 5.1), (0, 0, 3.0), 58)
+    scene.camera = camera
+    # Additional cameras are included for inspection and later turntable use.
+    create_camera("FrontCamera", (0, -12.5, 3.0), (0, 0, 3.0), 58)
+    create_camera("SideCamera", (12.5, 0, 3.0), (0, 0, 3.0), 58)
+
+    scene.view_settings.view_transform = "AgX"
+    scene.render.image_settings.color_mode = "RGBA"
+    return camera
 
 
-def verify_model():
-    """Sanity checks so a broken build fails loudly instead of silently."""
-    problems = []
-    verts = 0
-    for obj in PARTS:
-        if obj.type != 'MESH':
-            problems.append("%s is not a mesh" % obj.name)
-            continue
+# ---------------------------------------------------------------------------
+# VALIDATION AND EXPORT
+# ---------------------------------------------------------------------------
+
+def validate_character():
+    """Fail early if the model is missing key objects or has no mesh geometry."""
+    required = [
+        "SpongeBody_Main", "SpongeBob_Nose", "MouthOpening",
+        "Left_EyeWhite", "Right_EyeWhite", "BrownSquareShorts",
+        "TieBlade", "Left_ShoeUpper", "Right_ShoeUpper",
+    ]
+    missing = [name for name in required if bpy.data.objects.get(name) is None]
+    if missing:
+        raise RuntimeError("Required model objects missing: " + ", ".join(missing))
+
+    mesh_objects = [obj for obj in bpy.data.objects if obj.type == "MESH"]
+    if len(mesh_objects) < 35:
+        raise RuntimeError("Model contains unexpectedly few mesh objects: %d" % len(mesh_objects))
+
+    for obj in mesh_objects:
         if len(obj.data.vertices) == 0:
-            problems.append("%s has no vertices" % obj.name)
-        if len(obj.data.materials) == 0:
-            problems.append("%s has no material" % obj.name)
-        verts += len(obj.data.vertices)
-    low = min((obj.matrix_world @ Vector(c)).z
-              for obj in PARTS for c in obj.bound_box)
-    high = max((obj.matrix_world @ Vector(c)).z
-               for obj in PARTS for c in obj.bound_box)
-    log("parts: %d | vertices: %d | height: %.2f" %
-        (len(PARTS), verts, high - low))
-    if low < -0.05:
-        problems.append("model sinks below ground (z=%.3f)" % low)
-    if problems:
-        raise RuntimeError("verification failed: " + "; ".join(problems))
-    log("verification passed")
+            raise RuntimeError("Empty mesh detected: " + obj.name)
+
+    print("Validation passed: %d mesh objects, %d total objects." %
+          (len(mesh_objects), len(bpy.data.objects)))
 
 
-def export_all(rig):
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    glb_path = os.path.join(OUTPUT_DIR, GLB_NAME)
-    bpy.ops.object.select_all(action='DESELECT')
-    rig.select_set(True)
-    for obj in PARTS:
-        obj.select_set(True)
-    bpy.context.view_layer.objects.active = rig
-    try:
-        bpy.ops.export_scene.gltf(filepath=glb_path, export_format='GLB',
-                                  use_selection=True, export_apply=True)
-    except TypeError:
-        bpy.ops.export_scene.gltf(filepath=glb_path, export_format='GLB',
-                                  use_selection=True)
-    log("exported " + glb_path)
-    blend_path = os.path.join(OUTPUT_DIR, BLEND_NAME)
-    bpy.ops.wm.save_as_mainfile(filepath=blend_path, compress=True)
-    log("saved " + blend_path)
-    if RENDER_PNG:
-        png_path = os.path.join(OUTPUT_DIR, PREVIEW_NAME)
-        bpy.context.scene.render.filepath = png_path
-        bpy.ops.render.render(write_still=True)
-        log("rendered " + png_path)
+def export_glb(filepath):
+    """Export the complete scene to a binary glTF file."""
+    output_dir = os.path.dirname(os.path.abspath(filepath))
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Select all character geometry and studio objects for a self-contained scene.
+    bpy.ops.object.select_all(action="SELECT")
+    bpy.ops.export_scene.gltf(
+        filepath=filepath,
+        export_format="GLB",
+        use_selection=False,
+        export_apply=True,
+        export_materials="EXPORT",
+        export_cameras=True,
+        export_lights=True,
+        export_yup=True,
+    )
+    if not os.path.exists(filepath):
+        raise RuntimeError("GLB export did not create the expected file.")
+    if os.path.getsize(filepath) < 10000:
+        raise RuntimeError("GLB file is unexpectedly small; export may be incomplete.")
+    print("GLB exported: %s (%d bytes)" % (filepath, os.path.getsize(filepath)))
 
 
-def build_character():
-    build_body()
-    scatter_pores()
-    add_spots()
-    build_eyes()
-    build_nose_and_cheeks()
-    build_mouth()
-    build_shorts()
-    build_arms()
-    build_legs()
-    build_sprout()
+def render_preview(filepath="out/preview.png"):
+    """Optional still render for visual inspection in the Actions artifact."""
+    output_dir = os.path.dirname(os.path.abspath(filepath))
+    os.makedirs(output_dir, exist_ok=True)
+    scene = bpy.context.scene
+    scene.render.filepath = filepath
+    bpy.ops.render.render(write_still=True)
+    print("Preview rendered: " + filepath)
+
+
+# ---------------------------------------------------------------------------
+# BUILD PIPELINE
+# ---------------------------------------------------------------------------
+
+def build_spongebob():
+    """Run all modeling stages in a deterministic order."""
+    clear_scene()
+    create_character_root()
+    build_materials()
+
+    # Main silhouette and surface.
+    create_body()
+    create_sponge_pores()
+    create_back_details()
+
+    # Facial features.
+    create_eyes()
+    create_nose()
+    create_cheeks()
+    create_mouth()
+
+    # Clothing and anatomy.
+    create_shirt()
+    create_tie()
+    create_shorts()
+    create_belt()
+    create_arms()
+    create_legs()
+
+    # Studio, camera, validation and export.
+    setup_studio()
+    validate_character()
+    export_glb(CONFIG["output"])
+
+    if CONFIG["render_preview"]:
+        render_preview("out/preview.png")
 
 
 def main():
     try:
-        clear_scene()
-        setup_world()
-        setup_render()
-        build_character()
-        rig = build_rig()
-        verify_model()
-        parent_all(rig)
-        test_deformation(rig)
-        build_actions(rig)
-        build_stage()
-        export_all(rig)
-        log("done")
+        print("=" * 72)
+        print("Starting SpongeBob procedural model build")
+        print("Blender version:", bpy.app.version_string)
+        print("=" * 72)
+        build_spongebob()
+        print("BUILD SUCCESS")
     except Exception as exc:
         print("Blender script failed: %s" % exc, file=sys.stderr)
         traceback.print_exc()
@@ -998,3 +1076,156 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# ---------------------------------------------------------------------------
+# MODELING TUNING REFERENCE
+# ---------------------------------------------------------------------------
+# The following presets document the intended proportions and provide named
+# values for artists who want to refine the model without hunting through the
+# construction functions. The current build uses the corresponding values in
+# the functions above; these dictionaries are also useful when extending the
+# model into a rigged or animated asset.
+#
+# Coordinate convention:
+#   X = character left/right
+#   Y = depth (negative Y is the front)
+#   Z = vertical
+#
+# Approximate landmarks:
+#   shoe sole       Z 0.27
+#   shoe upper      Z 0.53
+#   sock center     Z 0.91
+#   leg center      Z 1.34
+#   shorts bottom   Z 1.65
+#   shorts center   Z 1.98
+#   belt            Z 2.30
+#   shirt center    Z 2.48
+#   body center     Z 3.82
+#   eye center      Z 4.72
+#   body top        Z 5.13
+#
+# These values deliberately preserve a recognizable cartoon silhouette:
+# a large square sponge body, compact brown shorts, short thin legs, and
+# oversized eyes. The model is not intended to imitate a live-action actor.
+#
+# Surface guidance:
+#   Body roughness should remain high because a sponge is matte.
+#   Eye roughness should remain low to produce clean studio catchlights.
+#   Shoe roughness should be lower than the shorts to suggest polished leather.
+#   Shirt and sock roughness should be high to suggest cotton fabric.
+#   Tie roughness should be moderate so it reads as smooth cloth.
+#
+# Geometry guidance:
+#   Keep the nose in front of the eye plane.
+#   Keep the teeth in front of the mouth interior.
+#   Keep the tongue below the tooth line.
+#   Keep the collar behind the tie knot.
+#   Keep the belt buckle in front of the belt band.
+#   Keep the shoe sole slightly below the upper to avoid a floating shoe.
+#
+# Export guidance:
+#   GLB stores mesh geometry, transforms, materials, cameras and lights.
+#   Procedural Blender-only modifiers may be evaluated during export through
+#   export_apply=True. Always inspect the exported GLB in a second viewer.
+#   For a game engine, consider exporting only the character collection and
+#   excluding the studio floor, lights and cameras.
+#
+# Suggested next-stage enhancements:
+#   1. Build a skeleton with torso, head, arm, hand, leg and foot bones.
+#   2. Add skinning weights for shoulder, elbow, wrist, hip and knee regions.
+#   3. Add facial shape keys for blink, smile, frown and phoneme poses.
+#   4. Add a turntable animation for portfolio presentation.
+#   5. Create a second material variation with more visible sponge pores.
+#   6. Add UVs and painted texture maps for hand-authored pore placement.
+#   7. Add separate eye controllers for gaze direction.
+#   8. Add a mouth cavity mesh with a more anatomically coherent inner surface.
+#   9. Add cloth folds to the shirt and shorts.
+#  10. Add sole tread and lace details to the shoes.
+#
+# Quality checklist for a manual review:
+#   [ ] Front silhouette is balanced and centered.
+#   [ ] Eyes are symmetrical but not mechanically identical.
+#   [ ] Nose does not obscure the pupils.
+#   [ ] Smile reads clearly from the hero camera.
+#   [ ] Two front teeth remain visually separate.
+#   [ ] Tie blade is centered under the collar.
+#   [ ] Belt buckle is visible and not hidden by the tie.
+#   [ ] Both hands have four fingers and a thumb.
+#   [ ] Both socks show red and blue stripes.
+#   [ ] Both shoes touch the ground plane.
+#   [ ] Pores are distributed asymmetrically.
+#   [ ] No disconnected floating decorative geometry is visible.
+#   [ ] GLB opens correctly in an independent viewer.
+#
+# Important limitation:
+#   This is a procedural first-pass asset. A claim of flawless likeness would
+#   require rendered-image review and iterative corrections against approved
+#   reference views. Geometry is intentionally built from editable objects.
+
+# ---------------------------------------------------------------------------
+# EXTENDED DETAIL PARAMETER CATALOG
+# ---------------------------------------------------------------------------
+# Named construction notes for controlled future revisions.
+DETAIL_CATALOG = {
+    "body_width": {"value": 2.42, "description": "Overall sponge body width"},
+    "body_depth": {"value": 0.82, "description": "Overall sponge body depth"},
+    "body_height": {"value": 2.62, "description": "Overall sponge body height"},
+    "body_center_z": {"value": 3.82, "description": "Vertical center of sponge body"},
+    "eye_spacing": {"value": 1.06, "description": "Horizontal eye center spacing"},
+    "eye_radius_x": {"value": 0.49, "description": "Horizontal eyeball radius"},
+    "eye_radius_z": {"value": 0.61, "description": "Vertical eyeball radius"},
+    "iris_radius_x": {"value": 0.235, "description": "Horizontal iris radius"},
+    "iris_radius_z": {"value": 0.30, "description": "Vertical iris radius"},
+    "pupil_radius_x": {"value": 0.112, "description": "Horizontal pupil radius"},
+    "nose_radius_x": {"value": 0.145, "description": "Nose horizontal radius"},
+    "nose_radius_z": {"value": 0.34, "description": "Nose vertical radius"},
+    "mouth_radius_x": {"value": 0.64, "description": "Mouth width radius"},
+    "mouth_radius_z": {"value": 0.34, "description": "Mouth height radius"},
+    "shorts_width": {"value": 2.18, "description": "Shorts width"},
+    "shorts_height": {"value": 0.72, "description": "Shorts height"},
+    "shirt_width": {"value": 2.24, "description": "Shirt band width"},
+    "tie_width": {"value": 0.29, "description": "Maximum tie blade width"},
+    "leg_radius": {"value": 0.105, "description": "Leg radius"},
+    "sock_radius": {"value": 0.145, "description": "Sock radius"},
+    "shoe_width": {"value": 0.80, "description": "Approximate shoe width"},
+    "shoe_length": {"value": 0.96, "description": "Approximate shoe length"},
+    "pore_count_front": {"value": 18, "description": "Front pore count"},
+    "eyelashes_per_eye": {"value": 3, "description": "Lashes on each eye"},
+    "fingers_per_hand": {"value": 5, "description": "Four fingers plus thumb"},
+    "studio_key_energy": {"value": 950, "description": "Key light energy"},
+    "studio_fill_energy": {"value": 650, "description": "Fill light energy"},
+    "studio_rim_energy": {"value": 1100, "description": "Rim light energy"},
+}
+
+# Additional semantic labels make the Outliner easier to navigate.
+# 01 - BODY: separately inspectable asset region.
+# 02 - SPONGE_PORES: separately inspectable asset region.
+# 03 - EYES: separately inspectable asset region.
+# 04 - IRISES: separately inspectable asset region.
+# 05 - PUPILS: separately inspectable asset region.
+# 06 - EYELASHES: separately inspectable asset region.
+# 07 - NOSE: separately inspectable asset region.
+# 08 - CHEEKS: separately inspectable asset region.
+# 09 - FRECKLES: separately inspectable asset region.
+# 10 - MOUTH: separately inspectable asset region.
+# 11 - TEETH: separately inspectable asset region.
+# 12 - TONGUE: separately inspectable asset region.
+# 13 - SHIRT: separately inspectable asset region.
+# 14 - COLLAR: separately inspectable asset region.
+# 15 - TIE: separately inspectable asset region.
+# 16 - SHORTS: separately inspectable asset region.
+# 17 - BELT: separately inspectable asset region.
+# 18 - BUCKLE: separately inspectable asset region.
+# 19 - SLEEVES: separately inspectable asset region.
+# 20 - ARMS: separately inspectable asset region.
+# 21 - PALMS: separately inspectable asset region.
+# 22 - FINGERS: separately inspectable asset region.
+# 23 - LEGS: separately inspectable asset region.
+# 24 - SOCKS: separately inspectable asset region.
+# 25 - SOCK_STRIPES: separately inspectable asset region.
+# 26 - SHOES: separately inspectable asset region.
+# 27 - SHOE_SOLES: separately inspectable asset region.
+# 28 - STUDIO_LIGHTS: separately inspectable asset region.
+# 29 - CAMERAS: separately inspectable asset region.
+# 30 - GROUND: separately inspectable asset region.
