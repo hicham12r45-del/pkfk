@@ -9,8 +9,12 @@ Environment variables (all optional):
     RENDER_PREVIEW  "1" to also render out/preview.png
 
 Outputs:
-    out/model.glb   the character (glTF binary)
-    out/coralo.blend the full scene
+    out/model.glb    the RIGGED character + "Idle" animation (glTF binary)
+    out/coralo.blend the full scene (rig, "Idle" and "Wave" actions)
+
+Rig: armature "CoraloRig" with 18 bones (Root, Hips, Body, Mouth, two Eyes,
+two-bone Sprout, two arms with Upper/Fore/Hand, two legs with Leg/Foot).
+Every mesh part is rigidly skinned to one bone through a vertex group.
 
 Compatible with Blender 3.x and 4.x.
 """
@@ -77,6 +81,18 @@ COL = {
 
 PARTS = []      # every character object is registered here
 _MATS = {}      # material cache
+
+# Shared layout constants (used by both the meshes and the rig)
+EYE_X = 0.42
+EYE_Z = 2.45
+LEG_X = 0.45
+ARM_POSE = {
+    # left arm waves hello, right arm rests by the side
+    "L": {"side": -1.0, "shoulder": (-1.0, 0.0, 2.15),
+          "elbow": (-1.55, -0.08, 2.60), "wrist": (-1.72, -0.25, 3.15)},
+    "R": {"side": 1.0, "shoulder": (1.0, 0.0, 2.15),
+          "elbow": (1.50, -0.10, 1.72), "wrist": (1.62, -0.26, 1.28)},
+}
 
 
 # =====================================================================
@@ -436,9 +452,9 @@ def build_eyes():
     pupil = mat_for("pupil", roughness=0.1, specular=0.9)
     shine = mat_for("shine", roughness=0.0)
     lash = mat_for("lash", roughness=0.4)
-    eye_z = 2.45
+    eye_z = EYE_Z
     for name, sx in (("L", -1.0), ("R", 1.0)):
-        cx = sx * 0.42
+        cx = sx * EYE_X
         make_sphere("Eye_White_" + name, 0.34,
                     (cx, FRONT_Y - 0.03, eye_z), white,
                     scale=(1.0, 0.5, 1.12))
@@ -567,11 +583,10 @@ def build_arm(prefix, side, shoulder, elbow, wrist):
 
 def build_arms():
     log("building arms")
-    # left arm waves hello, right arm rests by the side
-    build_arm("Arm_L", -1.0, (-1.0, 0.0, 2.15), (-1.55, -0.08, 2.60),
-              (-1.72, -0.25, 3.15))
-    build_arm("Arm_R", 1.0, (1.0, 0.0, 2.15), (1.50, -0.10, 1.72),
-              (1.62, -0.26, 1.28))
+    for key in ("L", "R"):
+        pose = ARM_POSE[key]
+        build_arm("Arm_" + key, pose["side"], pose["shoulder"],
+                  pose["elbow"], pose["wrist"])
 
 
 def build_legs():
@@ -613,6 +628,224 @@ def build_sprout():
                     segments=24, rings=12)
     make_sphere("Sprout_Bud", 0.055, tip + Vector((0, 0, 0.06)), leaf,
                 segments=16, rings=8)
+
+
+# =====================================================================
+# RIG: ARMATURE, SKINNING, TESTS, ANIMATION
+# =====================================================================
+EXPECTED_BONES = [
+    "Root", "Hips", "Body", "Mouth", "Eye_L", "Eye_R",
+    "Sprout_1", "Sprout_2",
+    "Arm_L_Upper", "Arm_L_Fore", "Hand_L",
+    "Arm_R_Upper", "Arm_R_Fore", "Hand_R",
+    "Leg_L", "Foot_L", "Leg_R", "Foot_R",
+]
+
+
+def bone_side(name):
+    if name.endswith("_L") or "_L_" in name:
+        return "L"
+    if name.endswith("_R") or "_R_" in name:
+        return "R"
+    return ""
+
+
+def bone_for_part(name):
+    """Decide which bone drives a mesh part, based on the part's name."""
+    side = bone_side(name)
+    if name.startswith("Arm_"):
+        if "_Hand" in name:
+            return "Hand_" + side
+        if name.endswith("_Elbow") or name.endswith("_Fore"):
+            return "Arm_%s_Fore" % side
+        return "Arm_%s_Upper" % side
+    if name.startswith(("Leg_", "Sock_")):
+        return "Leg_" + side
+    if name.startswith(("Shoe_", "Sole_")):
+        return "Foot_" + side
+    if name.startswith(("Eye_Iris", "Eye_Pupil", "Eye_Shine")):
+        return "Eye_" + side
+    if name.startswith(("Smile", "Dimple_", "Tooth_")):
+        return "Mouth"
+    if name.startswith("Sprout_Stem"):
+        return "Sprout_1"
+    if name.startswith("Sprout_"):
+        return "Sprout_2"
+    if name.startswith(("Shorts", "Belt", "Buckle", "Button", "Pocket")):
+        return "Hips"
+    return "Body"
+
+
+def build_rig():
+    log("building armature")
+    arm_data = bpy.data.armatures.new("CoraloArmature")
+    rig = bpy.data.objects.new("CoraloRig", arm_data)
+    bpy.context.collection.objects.link(rig)
+    select_only(rig)
+    bpy.ops.object.mode_set(mode='EDIT')
+    edit = arm_data.edit_bones
+
+    def add(name, head, tail, parent=None, connect=False, inherit='FULL'):
+        bone = edit.new(name)
+        bone.head = Vector(head)
+        bone.tail = Vector(tail)
+        if parent is not None:
+            bone.parent = edit[parent]
+            bone.use_connect = connect
+        bone.inherit_scale = inherit
+        return bone
+
+    add("Root", (0, 0, 0), (0, 0, 0.4))
+    add("Hips", (0, 0, BODY_BOTTOM), (0, 0, BODY_BOTTOM + 0.4), "Root")
+    add("Body", (0, 0, BODY_BOTTOM), (0, 0, BODY_TOP), "Hips")
+    add("Mouth", (0, FRONT_Y, 1.65), (0, FRONT_Y - 0.2, 1.65), "Body")
+
+    for key, sx in (("L", -1.0), ("R", 1.0)):
+        cx = sx * EYE_X
+        add("Eye_" + key, (cx, FRONT_Y - 0.03, EYE_Z),
+            (cx, FRONT_Y - 0.33, EYE_Z), "Body")
+
+    stem_tip = (0.03, 0.0, BODY_TOP + 0.40)
+    add("Sprout_1", (0, 0, BODY_TOP - 0.02), stem_tip, "Body")
+    add("Sprout_2", stem_tip, (0.03, 0.0, BODY_TOP + 0.52), "Sprout_1", True)
+
+    for key in ("L", "R"):
+        pose = ARM_POSE[key]
+        shoulder = Vector(pose["shoulder"])
+        elbow = Vector(pose["elbow"])
+        wrist = Vector(pose["wrist"])
+        hand_dir = (wrist - elbow).normalized()
+        add("Arm_%s_Upper" % key, shoulder, elbow, "Body", inherit='NONE')
+        add("Arm_%s_Fore" % key, elbow, wrist, "Arm_%s_Upper" % key, True)
+        add("Hand_" + key, wrist, wrist + hand_dir * 0.45,
+            "Arm_%s_Fore" % key, True)
+
+    for key, sx in (("L", -1.0), ("R", 1.0)):
+        x = sx * LEG_X
+        add("Leg_" + key, (x, 0, BODY_BOTTOM + 0.05), (x, 0, 0.22), "Hips")
+        add("Foot_" + key, (x, 0, 0.22), (x, -0.45, 0.12), "Leg_" + key,
+            True)
+
+    bpy.ops.object.mode_set(mode='OBJECT')
+    arm_data.display_type = 'OCTAHEDRAL'
+    rig.show_in_front = True
+    for pbone in rig.pose.bones:
+        pbone.rotation_mode = 'XYZ'
+
+    counts = skin_parts(rig)
+    verify_rig(rig, counts)
+    return rig
+
+
+def skin_parts(rig):
+    """Rigid skinning: each part gets one vertex group (weight 1.0)."""
+    bones = set(b.name for b in rig.data.bones)
+    counts = {}
+    for obj in PARTS:
+        if obj.type != 'MESH':
+            continue
+        bone_name = bone_for_part(obj.name)
+        if bone_name not in bones:
+            raise RuntimeError("no bone '%s' for part %s" %
+                               (bone_name, obj.name))
+        group = obj.vertex_groups.new(name=bone_name)
+        group.add(list(range(len(obj.data.vertices))), 1.0, 'REPLACE')
+        mod = obj.modifiers.new("Armature", 'ARMATURE')
+        mod.object = rig
+        counts[bone_name] = counts.get(bone_name, 0) + 1
+    return counts
+
+
+def verify_rig(rig, counts):
+    names = [b.name for b in rig.data.bones]
+    missing = [n for n in EXPECTED_BONES if n not in names]
+    if missing:
+        raise RuntimeError("missing bones: " + ", ".join(missing))
+    for bone in rig.data.bones:
+        if bone.length < 0.01:
+            raise RuntimeError("bone %s is too short" % bone.name)
+    unused = [n for n in EXPECTED_BONES
+              if n not in counts and n not in ("Root",)]
+    if unused:
+        log("bones without geometry (control only): " + ", ".join(unused))
+    for obj in PARTS:
+        if obj.type == 'MESH' and len(obj.vertex_groups) != 1:
+            raise RuntimeError("%s is not skinned correctly" % obj.name)
+    log("rig ok: %d bones, %d skinned parts" %
+        (len(names), sum(counts.values())))
+
+
+def evaluated_vertex(obj, index=0):
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    evaluated = obj.evaluated_get(depsgraph)
+    mesh = evaluated.to_mesh()
+    co = mesh.vertices[index].co.copy()
+    evaluated.to_mesh_clear()
+    return co
+
+
+def test_deformation(rig):
+    """Pose the left arm and make sure the palm really follows the bone."""
+    probe = bpy.data.objects.get("Arm_L_Hand_Palm")
+    if probe is None:
+        raise RuntimeError("probe part Arm_L_Hand_Palm not found")
+    bpy.context.view_layer.update()
+    before = evaluated_vertex(probe)
+    pbone = rig.pose.bones["Arm_L_Upper"]
+    pbone.rotation_euler = (0.7, 0.0, 0.0)
+    bpy.context.view_layer.update()
+    after = evaluated_vertex(probe)
+    pbone.rotation_euler = (0.0, 0.0, 0.0)
+    bpy.context.view_layer.update()
+    moved = (after - before).length
+    log("deformation test: palm moved %.3f units" % moved)
+    if moved < 0.05:
+        raise RuntimeError("skinning failed: palm did not follow the arm")
+
+
+def key_pose(rig, bone, prop, frame, value):
+    pbone = rig.pose.bones[bone]
+    setattr(pbone, prop, value)
+    pbone.keyframe_insert(data_path=prop, frame=frame)
+
+
+def reset_pose(rig):
+    for pbone in rig.pose.bones:
+        pbone.rotation_euler = (0.0, 0.0, 0.0)
+        pbone.scale = (1.0, 1.0, 1.0)
+        pbone.location = (0.0, 0.0, 0.0)
+
+
+def build_actions(rig):
+    """Two demo actions: 'Wave' (stored) and 'Idle' (active, exported)."""
+    try:
+        scene = bpy.context.scene
+        scene.frame_start = 1
+        scene.frame_end = 49
+        anim = rig.animation_data_create()
+
+        wave = bpy.data.actions.new("Wave")
+        wave.use_fake_user = True
+        anim.action = wave
+        for frame, angle in ((1, 0.0), (7, 0.5), (13, -0.5), (19, 0.5),
+                             (25, -0.5), (31, 0.0)):
+            key_pose(rig, "Hand_L", "rotation_euler", frame,
+                     (angle, 0.0, 0.0))
+        reset_pose(rig)
+
+        idle = bpy.data.actions.new("Idle")
+        idle.use_fake_user = True
+        anim.action = idle
+        for frame, squash in ((1, 1.0), (25, 0.965), (49, 1.0)):
+            widen = 1.0 + (1.0 - squash)
+            key_pose(rig, "Body", "scale", frame, (widen, widen, squash))
+        for frame, tilt in ((1, 0.0), (25, 0.1), (49, 0.0)):
+            key_pose(rig, "Sprout_1", "rotation_euler", frame,
+                     (tilt, 0.0, tilt * 0.5))
+        reset_pose(rig)
+        log("actions created: Wave, Idle (Idle is active)")
+    except Exception as exc:
+        log("animation actions skipped: %s" % exc)
 
 
 # =====================================================================
@@ -668,13 +901,14 @@ def build_stage():
 # =====================================================================
 # ASSEMBLY, VERIFICATION, EXPORT
 # =====================================================================
-def parent_all():
+def parent_all(rig):
     root = bpy.data.objects.new("Coralo", None)
     root.empty_display_type = 'PLAIN_AXES'
     bpy.context.collection.objects.link(root)
+    rig.parent = root
     for obj in PARTS:
-        obj.parent = root
-    log("parented %d parts under 'Coralo'" % len(PARTS))
+        obj.parent = rig
+    log("parented %d parts under 'CoraloRig'" % len(PARTS))
     return root
 
 
@@ -704,12 +938,14 @@ def verify_model():
     log("verification passed")
 
 
-def export_all():
+def export_all(rig):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     glb_path = os.path.join(OUTPUT_DIR, GLB_NAME)
     bpy.ops.object.select_all(action='DESELECT')
+    rig.select_set(True)
     for obj in PARTS:
         obj.select_set(True)
+    bpy.context.view_layer.objects.active = rig
     try:
         bpy.ops.export_scene.gltf(filepath=glb_path, export_format='GLB',
                                   use_selection=True, export_apply=True)
@@ -746,10 +982,13 @@ def main():
         setup_world()
         setup_render()
         build_character()
+        rig = build_rig()
         verify_model()
-        parent_all()
+        parent_all(rig)
+        test_deformation(rig)
+        build_actions(rig)
         build_stage()
-        export_all()
+        export_all(rig)
         log("done")
     except Exception as exc:
         print("Blender script failed: %s" % exc, file=sys.stderr)
